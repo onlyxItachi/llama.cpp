@@ -27,6 +27,14 @@ The clean post-rebase head was
 `73ab9f23ecb5b1c3fc7e34b966236287dfe7b8d1`. No XDNA commit or user work was
 dropped, and no commit from this phase was pushed.
 
+After the shared-host scheduler and real-GGUF work, the pre-rebase XDNA head was
+`8d6e9a84caf2b1b467079e0d97dfe3e9264f0c00`. A backup ref named
+`backup/ggml-xdna-pre-rebase-20260811-2349` preserves it. The branch was then
+rebased cleanly onto upstream
+[`7b13a8404d7e219c13d1a243e2a21a857a6e99d9`](https://github.com/ggml-org/llama.cpp/commit/7b13a8404d7e219c13d1a243e2a21a857a6e99d9), producing post-rebase head
+`7cb812a91a440699b7ee2268d01d10a98d51a0fd`. `git range-diff` reports all 20
+XDNA commits patch-equivalent. This rebase also remains local and unpushed.
+
 The current default-branch heads inspected with Git and GitHub CLI were:
 
 | Project | Exact revision |
