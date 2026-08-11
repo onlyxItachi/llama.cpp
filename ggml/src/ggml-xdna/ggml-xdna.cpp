@@ -18,6 +18,7 @@ namespace {
 
 struct xdna_device_context {
     ggml_xdna::device_info info;
+    ggml_xdna::readonly_userptr_capability readonly_userptr;
     ggml_xdna::kernel_configuration kernel_configuration;
     std::string name;
     std::string description;
@@ -191,10 +192,10 @@ static void ggml_backend_xdna_device_get_props(ggml_backend_dev_t dev, ggml_back
         /* .host_buffer          = */ false,
         /* .buffer_from_host_ptr = */ false,
         /* .events               = */ false,
-        // The installed amdxdna driver must be able to pin PROT_READ mappings before
-        // host-pointer wrapping and mmap loading can be enabled. Writable CPU buffers
-        // are registered lazily by the compute runtime instead.
-        /* .mmap_support         = */ false,
+        // This is enabled only after XRT registers a page-aligned PROT_READ,
+        // MAP_SHARED file mapping and synchronizes a nonzero-offset child view
+        // on this device. Writable CPU buffers are handled independently.
+        /* .mmap_support         = */ ctx->readonly_userptr.supported,
     };
 }
 
@@ -256,9 +257,13 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const g
 }
 
 static bool ggml_backend_xdna_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
-    GGML_UNUSED(dev);
+    auto * ctx = static_cast<xdna_device_context *>(dev->context);
     if (buft == ggml_backend_cpu_buffer_type()) {
         return true;
+    }
+
+    if (ggml_backend_buft_is_cpu_mapped(buft)) {
+        return ctx->readonly_userptr.supported;
     }
 
     // Device-owned host buffer types are the existing GGML contract for
@@ -322,8 +327,24 @@ struct xdna_registry_context {
             auto ctx = std::make_unique<xdna_device_context>();
             ctx->info = std::move(info);
             ctx->kernel_configuration = ggml_xdna::probe_kernel_configuration(ctx->info);
+            if (ctx->kernel_configuration.available) {
+                ctx->readonly_userptr = ggml_xdna::probe_readonly_userptr(ctx->info);
+            } else {
+                ctx->readonly_userptr.status =
+                        "not probed because no validated kernel artifact is configured";
+            }
             ctx->name = "XDNA" + std::to_string(ordinal);
             ctx->description = ctx->info.name + " (" + ctx->info.architecture + ")";
+            if (ctx->readonly_userptr.supported) {
+                GGML_LOG_INFO("ggml_xdna: %s read-only mmap registration enabled: %s\n",
+                        ctx->name.c_str(), ctx->readonly_userptr.status.c_str());
+            } else if (!ctx->kernel_configuration.available) {
+                GGML_LOG_INFO("ggml_xdna: %s read-only mmap registration disabled: %s\n",
+                        ctx->name.c_str(), ctx->readonly_userptr.status.c_str());
+            } else {
+                GGML_LOG_WARN("ggml_xdna: %s read-only mmap registration disabled: %s\n",
+                        ctx->name.c_str(), ctx->readonly_userptr.status.c_str());
+            }
             devices.push_back({
                 /* .iface   = */ ggml_backend_xdna_device_i,
                 /* .reg     = */ reg,

@@ -13,12 +13,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cinttypes>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <fcntl.h>
 #include <fstream>
 #include <limits>
 #include <memory>
@@ -26,6 +28,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <system_error>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <utility>
 #include <vector>
@@ -60,6 +64,58 @@ std::string architecture_description(const std::string & name, device_architectu
 
 bool is_xdna_device_name(const std::string & name) {
     return name.rfind("RyzenAI-npu", 0) == 0;
+}
+
+class scoped_fd {
+public:
+    explicit scoped_fd(int value = -1) noexcept : value(value) {}
+    ~scoped_fd() {
+        if (value >= 0) {
+            ::close(value);
+        }
+    }
+
+    scoped_fd(const scoped_fd &) = delete;
+    scoped_fd & operator=(const scoped_fd &) = delete;
+
+    int get() const noexcept {
+        return value;
+    }
+
+    void reset(int replacement = -1) noexcept {
+        if (value >= 0) {
+            ::close(value);
+        }
+        value = replacement;
+    }
+
+private:
+    int value;
+};
+
+class scoped_mapping {
+public:
+    scoped_mapping(void * value, size_t bytes) noexcept : value(value), bytes(bytes) {}
+    ~scoped_mapping() {
+        if (value != MAP_FAILED) {
+            ::munmap(value, bytes);
+        }
+    }
+
+    scoped_mapping(const scoped_mapping &) = delete;
+    scoped_mapping & operator=(const scoped_mapping &) = delete;
+
+    void * get() const noexcept {
+        return value;
+    }
+
+private:
+    void * value;
+    size_t bytes;
+};
+
+[[noreturn]] void throw_system_error(const char * operation) {
+    throw std::system_error(errno, std::generic_category(), operation);
 }
 
 uint32_t read_le32(const unsigned char * value) {
@@ -233,6 +289,84 @@ std::vector<device_info> discover_devices(std::string * error) noexcept {
             *error = "unknown XRT device discovery failure";
         }
     }
+    return result;
+}
+
+readonly_userptr_capability probe_readonly_userptr(const device_info & info) noexcept {
+    readonly_userptr_capability result;
+#if defined(__linux__)
+    char path[] = "/tmp/ggml-xdna-readonly-XXXXXX";
+    try {
+        const long page_size_value = ::sysconf(_SC_PAGESIZE);
+        if (page_size_value <= 0) {
+            throw std::runtime_error("failed to query the system page size");
+        }
+        const size_t page_size = static_cast<size_t>(page_size_value);
+
+        scoped_fd writable(::mkstemp(path));
+        if (writable.get() < 0) {
+            throw_system_error("mkstemp");
+        }
+        if (::ftruncate(writable.get(), static_cast<off_t>(page_size)) != 0) {
+            throw_system_error("ftruncate");
+        }
+        constexpr size_t probe_view_offset = 64;
+        constexpr size_t probe_view_bytes = 128;
+        if (page_size < probe_view_offset + probe_view_bytes) {
+            throw std::runtime_error("system page is too small for the read-only userptr subview probe");
+        }
+        const unsigned char marker = 0xa5;
+        const ssize_t written = ::pwrite(
+                writable.get(), &marker, sizeof(marker), static_cast<off_t>(probe_view_offset));
+        if (written < 0) {
+            throw_system_error("pwrite");
+        }
+        if (written != static_cast<ssize_t>(sizeof(marker))) {
+            throw std::runtime_error("short write while preparing read-only probe file");
+        }
+        writable.reset();
+
+        scoped_fd readonly(::open(path, O_RDONLY | O_CLOEXEC));
+        if (readonly.get() < 0) {
+            throw_system_error("open read-only probe file");
+        }
+        if (::unlink(path) != 0) {
+            throw_system_error("unlink read-only probe file");
+        }
+        path[0] = '\0';
+
+        void * address = ::mmap(nullptr, page_size, PROT_READ, MAP_SHARED, readonly.get(), 0);
+        if (address == MAP_FAILED) {
+            throw_system_error("mmap read-only probe file");
+        }
+        scoped_mapping mapping(address, page_size);
+        readonly.reset();
+
+        // Parent construction reaches the amdxdna userptr CREATE_BO ioctl and
+        // pins the mapping. The nonzero-offset child and TO_DEVICE sync mirror
+        // the complete immutable-weight path used before kernel submission.
+        // Child and parent destruction must precede munmap.
+        xrt::device device(info.index);
+        {
+            xrt::bo registration(device, mapping.get(), page_size, xrt::bo::flags::host_only, 0);
+            xrt::bo view(registration, probe_view_bytes, probe_view_offset);
+            view.sync(XCL_BO_SYNC_BO_TO_DEVICE, probe_view_bytes, 0);
+        }
+
+        result.supported = true;
+        result.status = "XRT registered and synchronized a PROT_READ MAP_SHARED file subview";
+    } catch (const std::exception & e) {
+        result.status = std::string("XRT PROT_READ userptr probe failed: ") + e.what();
+    } catch (...) {
+        result.status = "XRT PROT_READ userptr probe failed with an unknown error";
+    }
+    if (path[0] != '\0') {
+        ::unlink(path);
+    }
+#else
+    GGML_UNUSED(info);
+    result.status = "read-only userptr probing is implemented only on Linux";
+#endif
     return result;
 }
 

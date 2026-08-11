@@ -21,6 +21,11 @@ struct device_info {
     std::string architecture;
 };
 
+struct readonly_userptr_capability {
+    bool supported = false;
+    std::string status;
+};
+
 struct kernel_artifact_configuration {
     const xdna_kernel_variant * variant = nullptr;
     std::string artifact_path;
@@ -38,6 +43,7 @@ struct kernel_configuration {
 };
 
 std::vector<device_info> discover_devices(std::string * error = nullptr) noexcept;
+readonly_userptr_capability probe_readonly_userptr(const device_info & info) noexcept;
 kernel_configuration probe_kernel_configuration(const device_info & info) noexcept;
 const kernel_artifact_configuration * select_kernel_configuration(
         const kernel_configuration & configuration,

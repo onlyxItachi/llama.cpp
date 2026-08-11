@@ -2625,6 +2625,10 @@ static ggml_backend_buffer_type_t ggml_backend_cpu_buffer_from_ptr_type(void) {
     return &ggml_backend_cpu_buffer_type;
 }
 
+bool ggml_backend_buft_is_cpu_mapped(ggml_backend_buffer_type_t buft) {
+    return buft == ggml_backend_cpu_buffer_from_ptr_type();
+}
+
 ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size) {
     GGML_ASSERT((uintptr_t)ptr % TENSOR_ALIGNMENT == 0 && "buffer pointer must be aligned");
     return ggml_backend_buffer_init(ggml_backend_cpu_buffer_from_ptr_type(), ggml_backend_cpu_buffer_from_ptr_i, ptr, size);

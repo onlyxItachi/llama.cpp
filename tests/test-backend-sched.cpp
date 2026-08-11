@@ -201,6 +201,24 @@ static void require(bool condition, const char * message) {
     }
 }
 
+static void test_cpu_mapped_buffer_type_identity() {
+    alignas(64) unsigned char storage[64] = {};
+    ggml_backend_buffer_t mapped = ggml_backend_cpu_buffer_from_ptr(storage, sizeof(storage));
+    require(mapped != nullptr, "failed to wrap CPU mapped test storage");
+    require(
+            ggml_backend_buft_is_cpu_mapped(ggml_backend_buffer_get_type(mapped)),
+            "CPU_Mapped buffer type was not identified");
+    require(
+            !ggml_backend_buft_is_cpu_mapped(ggml_backend_cpu_buffer_type()),
+            "ordinary CPU buffer type was misidentified as CPU_Mapped");
+
+    ggml_backend_buffer_type fake_host = make_mock_buffer_type(true);
+    require(
+            !ggml_backend_buft_is_cpu_mapped(&fake_host),
+            "unrelated host buffer type was misidentified as CPU_Mapped");
+    ggml_backend_buffer_free(mapped);
+}
+
 struct buffer_observer_test_state {
     int sequence = 0;
     int provider_calls = 0;
@@ -486,6 +504,7 @@ static void test_accel_offload_preference(
 
 int main() {
     test_buffer_free_observers();
+    test_cpu_mapped_buffer_type_identity();
 
     const enum ggml_backend_dev_type target_types[] = {
         GGML_BACKEND_DEVICE_TYPE_GPU,

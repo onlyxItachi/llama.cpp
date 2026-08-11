@@ -176,9 +176,10 @@ Physical probes on this machine established:
 - The installed kernel driver rejects a `PROT_READ` GGUF-like mmap for both
   ordinary and read-access extended BO constructors with CREATE_BO errno 12.
   A 16 MiB writable private mapping then COWed the full 16 MiB, so that is not a
-  workaround. Current upstream driver added read-only pinning in
-  [`97cfa4c673f09d321c613e55761d44a4cc378d11`](https://github.com/amd/xdna-driver/commit/97cfa4c673f09d321c613e55761d44a4cc378d11), but the installed module must be
-  upgraded and re-tested before `mmap_support` can be enabled.
+  workaround. Current upstream driver added read-only pinning and read-only
+  IOMMU permissions in
+  [`ed8fb2dd172bde623d7112a1bd674fc0e3c4cae4`](https://github.com/amd/xdna-driver/commit/ed8fb2dd172bde623d7112a1bd674fc0e3c4cae4), but the installed module must be
+  upgraded before that path can pass locally.
 
 Backend statistics label their counter `explicit_payload_BOs`: it covers
 payload/root BO allocations made directly by ggml-xdna, not lightweight
@@ -186,16 +187,29 @@ subviews, command BOs, or other internal BOs allocated by XRT. Driver-level
 creation evidence comes from the ioctl trace above; those counts, too, remain
 constant rather than growing with repeated submissions.
 
-The present slice therefore registers writable GGML host allocations with no
-XDNA weight shadow. It deliberately reports both `buffer_from_host_ptr=false`
-and `mmap_support=false`. GGML distinguishes its writable allocation as `CPU`
-from an externally wrapped/mmap allocation as the private `CPU_Mapped` buffer
-type. XDNA admits exact `CPU` storage plus a non-null device owner's exact
-declared host buffer type; this accepts the physically validated `ROCm_Host`
-allocation but continues to reject device-less `CPU_Mapped`. Normal automatic
-mmap loading therefore remains safe and its nodes stay on fallback backends.
-`--load-mode none` is still required on this driver for an XDNA-eligible model
-allocation.
+The backend does not infer mmap safety from a driver version. When at least one
+validated kernel artifact is configured, XDNA device registration creates one
+page of file-backed `PROT_READ`, `MAP_SHARED` storage and asks XRT to construct
+and destroy a `host_only` user-pointer parent BO over that page. It also creates
+a nonzero-offset child BO and performs the same range-limited TO_DEVICE sync
+used by an immutable weight. Any mapping, parent, subview, sync, or driver
+failure is caught and logged, `mmap_support` remains false, and `CPU_Mapped`
+remains unsupported. Only a successful full-path probe enables both
+properties. The probe covers the CREATE_BO/pinning/subview/coherency path used
+later by a GGUF tensor, while keeping `buffer_from_host_ptr=false`: llama.cpp
+continues to create the non-owning CPU wrapper around its mmap. With no usable
+artifact the capability is explicitly reported as unprobed and disabled, and
+backend discovery does not issue a userptr CREATE_BO merely to list an
+unusable device.
+
+GGML now exposes an internal identity predicate for the otherwise-private
+`CPU_Mapped` singleton. XDNA uses that exact identity instead of accepting all
+device-less host buffer types. Writable `CPU` and an owning device's declared
+host buffer (including the physically validated `ROCm_Host`) remain separate
+supported cases. On the installed driver the probe fails closed, so
+`--load-mode none` is still required for an XDNA-eligible model allocation;
+after a driver upgrade the same binary can enable read-only mmap only if the
+runtime probe actually succeeds.
 
 Immutable `GGML_BACKEND_BUFFER_USAGE_WEIGHTS` take the persistent userptr path.
 Ordinary mutable/test buffers use a separate state-owned XRT BO: the runtime
@@ -690,7 +704,7 @@ AIE2P kernel.
 | Real GGML `MUL_MAT` on XDNA? | **GO for fixed Q4_0 and BF16 shapes**; CPU comparisons pass and a real GGUF `Qcur-0` node executed. |
 | Fundamentally UMA/system-backed weights? | **GO for writable CPU and `ROCm_Host` allocations**: a physical HIP/XDNA probe consumed the same page-aligned system-memory weight pointer, with one XRT registration and no secondary weight copy. |
 | Reuse without per-token weight copy? | **GO for model-lifetime immutable buffers**: persistent parent/view/run, constant registrations, zero weight-copy bytes. Mutable/test weights use one explicit native-byte staging copy per call. **NO for arbitrary immutable-buffer lifetimes** until registration ownership moves into an XDNA buffer type. |
-| Ordinary read-only GGUF mmap? | **NO on the installed driver**; XDNA rejects `CPU_Mapped`, so default loading falls back safely. Upstream's driver fix exists but is not yet physically validated here. |
+| Ordinary read-only GGUF mmap? | **NO on the installed driver, fail-closed automatically**: an actual file-backed `PROT_READ` XRT userptr parent, nonzero-offset child, and TO_DEVICE sync gate `mmap_support` and exact `CPU_Mapped` acceptance. Upstream driver commit `ed8fb2dd172bde623d7112a1bd674fc0e3c4cae4` contains the required read-only pin/IOMMU path, but it is not installed or physically validated here. |
 | Quantized batch-one GEMV? | **GO for native 288x288, 512x2560, and 10240x2560 Q4_0**. All three registered variants pass together in one physical backend instance; the production variants reach 6.91 and 19.25 GB/s without repacking or a secondary immutable-weight copy. Broader dtype/shape coverage remains open. |
 | ROCm comparison and hybrid value? | **Capability scheduling, shared weights, and a real small-GGUF hybrid graph GO; performance NO-GO for the measured isolated shapes.** Normal `[ROCm,XDNA,CPU]` order keeps `pp32` off XDNA and executes 48 XDNA projections for `tg2` from one `ROCm_Host` model allocation, with persistent page-window registrations and zero immutable-weight copy. Fair synchronized HIP is about 4.4-5.0x faster at 512x2560 and 4.7-4.9x at 10240x2560; HIP is about 12x faster at 288x288. Fused K/V saves one XDNA command floor but remains slower than HIP, and the tested gate/up pair is slower than two optimized XDNA calls. No end-to-end hybrid performance win is claimed. |
 | NPU utilization and energy? | **OPEN**: installed XRT/sysfs exposes neither a per-kernel utilization/energy counter nor estimated NPU power (`Estimated Power: N/A`); external SoC telemetry is required. |

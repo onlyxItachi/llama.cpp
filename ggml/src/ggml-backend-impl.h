@@ -99,6 +99,12 @@ extern "C" {
     // do not use directly, use ggml_backend_tensor_copy instead
     GGML_API bool ggml_backend_buffer_copy_tensor(const struct ggml_tensor * src, struct ggml_tensor * dst);
 
+    // True only for the private non-owning buffer type returned by
+    // ggml_backend_cpu_buffer_from_ptr(). Backends that can consume ordinary
+    // writable host allocations must not infer support for read-only mmap
+    // storage from ggml_backend_buft_is_host() alone.
+    GGML_API bool ggml_backend_buft_is_cpu_mapped(ggml_backend_buffer_type_t buft);
+
     // multi-buffer
     // buffer that contains a collection of buffers
     GGML_API ggml_backend_buffer_t ggml_backend_multi_buffer_alloc_buffer(ggml_backend_buffer_t * buffers, size_t n_buffers);
