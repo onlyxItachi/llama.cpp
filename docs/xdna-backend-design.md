@@ -1,8 +1,7 @@
 # Native AMD XDNA backend: bring-up design and evidence
 
-Status: experimental vertical slice, 2026-08-11. This document records what
-was inspected and physically exercised; it is not a claim of production-ready
-XDNA decode.
+Status: experimental vertical slice, updated 2026-08-12.
+This document records what was inspected and physically exercised; it is not a claim of production-ready XDNA decode.
 
 ## Revisions and repository state
 
@@ -33,7 +32,12 @@ After the shared-host scheduler and real-GGUF work, the pre-rebase XDNA head was
 rebased cleanly onto upstream
 [`7b13a8404d7e219c13d1a243e2a21a857a6e99d9`](https://github.com/ggml-org/llama.cpp/commit/7b13a8404d7e219c13d1a243e2a21a857a6e99d9), producing post-rebase head
 `7cb812a91a440699b7ee2268d01d10a98d51a0fd`. `git range-diff` reports all 20
-XDNA commits patch-equivalent. This rebase also remains local and unpushed.
+XDNA commits patch-equivalent. The rebased history was published to
+`origin/feat/ggml-xdna` with an explicit SHA-bound `--force-with-lease`; later
+validated milestones have been pushed normally on top of it.
+
+The lifetime and mmap audit below starts from XDNA head `62661d56d393c142155a1e4fa47cb7c3b83ea9f0`.
+Its relevant implementation milestones are the generic observer at `2a27ff2065d46e3406828562d9079d55c0f70b09`, XDNA owner-lifetime eviction at `9d55fecb6cfb221489f052f8b324910c23883a69`, run quiescence at `1771128c472824fdf7a0f84c3bbe4bdb31ac8f77`, and the read-only mmap capability probe at the audit head.
 
 The current default-branch heads inspected with Git and GitHub CLI were:
 
@@ -144,7 +148,7 @@ host devices. XDNA registers page-rounded windows of the immutable tensors it
 actually selects, with each tensor expressed as a child offset:
 
 ```text
-GGML host allocation (model-lifetime owner)
+GGML host allocation (observed buffer owner)
   -> cached XRT host_only userptr BO for a selected tensor's page window
      -> root-derived immutable weight sub-BOs
         -> shim DMA / memory tile / AIE compute tile
@@ -202,14 +206,12 @@ artifact the capability is explicitly reported as unprobed and disabled, and
 backend discovery does not issue a userptr CREATE_BO merely to list an
 unusable device.
 
-GGML now exposes an internal identity predicate for the otherwise-private
-`CPU_Mapped` singleton. XDNA uses that exact identity instead of accepting all
-device-less host buffer types. Writable `CPU` and an owning device's declared
-host buffer (including the physically validated `ROCm_Host`) remain separate
-supported cases. On the installed driver the probe fails closed, so
-`--load-mode none` is still required for an XDNA-eligible model allocation;
-after a driver upgrade the same binary can enable read-only mmap only if the
-runtime probe actually succeeds.
+GGML now exposes an internal identity predicate for the otherwise-private `CPU_Mapped` singleton.
+XDNA uses that exact identity instead of accepting all device-less host buffer types.
+Writable `CPU` and an owning device's declared host buffer (including the physically validated `ROCm_Host`) remain separate supported cases.
+On the installed driver the physical probe logged `DRM_IOCTL_AMDXDNA_CREATE_BO` errno 12 (`ENOMEM`) and failed closed, so `--load-mode none` is still required for an XDNA-eligible model allocation.
+The evidence log `mmap-capability-combined-20260812.log` has SHA-256 `19669d9e7b6b6bb2c9e6c7c7aea2d6cfa34899289458f3635b4f717f459e9b42`.
+After a driver upgrade, a successful run of the complete probe is the positive gate that enables both `mmap_support` and exact `CPU_Mapped` acceptance; that positive outcome has not been physically validated here.
 
 Immutable `GGML_BACKEND_BUFFER_USAGE_WEIGHTS` take the persistent userptr path.
 Ordinary mutable/test buffers use a separate state-owned XRT BO: the runtime
@@ -222,17 +224,19 @@ backend test executable without weakening the no-secondary-copy claim for
 immutable model weights. It also avoids the stale-data failure previously seen
 when mutable userptr registrations were recreated at a reused address.
 
-Independent HIP and XRT registrations of exactly the same `ROCm_Host` pages are
-now physically proven; dma-buf export is not required for this read/read weight
-case. The lazy XRT registration cache remains backend-lifetime scoped and is
-limited to immutable model/test weight buffers that must outlive their cached
-views. Scheduler output is not registered: each kernel state owns a persistent
-output BO sized for that variant and copies it back after synchronization, so
-context reserve/reallocation cannot leave a transient scheduler allocation
-pinned. Before supporting arbitrary immutable-buffer lifetimes, GGML needs a
-cancelable buffer-free observer so XDNA can destroy child views and parent XRT
-BOs before the actual owner (including ROCm) releases the host allocation. An
-XDNA-owned wrapper alone cannot solve the shared `ROCm_Host` case.
+Independent HIP and XRT registrations of exactly the same `ROCm_Host` pages are now physically proven; dma-buf export is not required for this read/read weight case.
+The registration cache remains backend scoped, but registrations no longer require their immutable owners to outlive the backend.
+GGML now provides a generic, cancelable buffer-free observer.
+XDNA subscribes once per owner; the callback resets every run bound to that owner, destroys tensor child views, and then destroys the userptr parent registrations before the provider releases the allocation.
+If the XDNA runtime is destroyed first, it cancels each remaining subscription before releasing runtime state.
+Scheduler output is not registered: each kernel state owns a persistent output BO sized for that variant and copies it back after synchronization, so context reserve/reallocation cannot leave a transient scheduler allocation pinned.
+
+An `xrt::run` retains its bound weight BO, so owner eviction also clears that binding by destroying the run.
+The next call recreates the run lazily and binds the current weight.
+A binding exception likewise discards a partially bound run.
+If `wait()` throws after submission, the runtime synchronously calls `xrt::run::abort()` before releasing borrowed storage, then resets the run; failure to abort terminates the process rather than risk an active userptr.
+The generic observer contract requires add, remove, and free calls for a buffer to be caller-serialized.
+Concurrent compute, owner destruction, and backend teardown are not claimed as supported.
 
 Page-window registration avoids pinning an unrelated full model allocation.
 Adjacent GGML weights can share a boundary page, so their rounded XRT parents
@@ -241,16 +245,11 @@ six-layer GGUF run: 24 distinct weight windows registered and all 24 were reused
 on the next token. Registration accounting deliberately reports rounded bytes,
 so a shared boundary page can be counted in more than one root.
 
-That lifetime restriction is demonstrated, not hypothetical. A stress probe
-kept one XDNA backend alive, freed an immutable-weight GGML buffer, then
-allocated a replacement at the same owner/data addresses. The raw-pointer cache
-reported two hits and only the original sync; subsequent results had NMSE
-0.0481 and 0.189 instead of the first call's 9.55e-8. The current slice is thus
-safe only under the llama.cpp model/context ordering used here, where model
-weights remain alive until the XDNA context/backend is destroyed. It is not a
-general-purpose upstream-ready buffer cache. A cancelable, provider-independent
-GGML buffer-free observer is the required fix before broadening use; the XDNA
-runtime must unsubscribe if it is destroyed before the backing buffer.
+The pre-observer raw-pointer cache had reproduced stale reuse after an immutable owner was freed and its addresses were recycled.
+The post-fix physical ABA regression kept one XDNA backend alive and obtained exactly the same owner, base, and tensor-data addresses for the replacement allocation.
+The payload hash changed from `8823c6106c634768` to `58f6252aff3024af`; eviction occurred before the second registration; both CPU-reference comparisons passed; and the final counters reported two root registrations, zero registration hits, two weight views, zero weight-view hits, and two weight syncs.
+The evidence log `physical-6.log` has SHA-256 `cde292dfd2adbf704368c2e4945ec5a244470de2918f3f9314f3b971fe7ec7b6`.
+This proves serialized destruction and exact-address reuse without stale cache hits; it does not prove concurrent teardown safety.
 
 ## Implemented vertical slice
 
@@ -289,16 +288,13 @@ likewise receives metadata from the shape-specific build instead of
 maintaining a second dtype/shape table. This is deliberately a specialization
 registry, not a universally dynamic kernel.
 
-The runtime now discovers every configured registered bundle, validates each
-one independently, and constructs one persistent XCLBIN/context/kernel/run
-state per valid artifact. Both device capability reporting and execution use
-the same `xdna_problem` selector. A physical process loaded the 288x288,
-512x2560, and 10240x2560 full-array artifacts simultaneously and passed all
-three CPU-reference tests, proving that the installed XRT stack permits
-multiple persistent full-array contexts. UMA weight registrations remain
-shared across those states. Malformed optional bundles are rejected without
-hiding valid variants; an XRT load failure rejects the complete backend
-instance so capability reporting cannot advertise an unavailable state.
+The runtime now discovers every configured registered bundle, validates each one independently, and constructs one XCLBIN/context/kernel state per valid artifact with a normally persistent, lazily recreated run.
+Both device capability reporting and execution use the same `xdna_problem` selector.
+A physical process loaded the Q4_0 288x288, BF16 288x288, Q4_0 512x2560, and Q4_0 10240x2560 full-array artifacts simultaneously and passed all four CPU-reference tests.
+The combined log `four-variant-quiescence.log` has SHA-256 `c27483c71049f26399f089d1b74e97e5ebdb49cd4e2c787339f9020e68df869e`.
+This proves that the installed XRT stack permits the four persistent full-array contexts after the lifetime and run-quiescence changes; it does not exercise an injected `wait()` failure.
+UMA weight registrations remain shared across those states.
+Malformed optional bundles are rejected without hiding valid variants; an XRT load failure rejects the complete backend instance so capability reporting cannot advertise an unavailable state.
 
 The configured variant accepts only its exact contract:
 
@@ -573,8 +569,8 @@ XDNA for `N=1` and ROCm for `N=32` from the same `ROCm_Host` pointer. XDNA
 admits that buffer through the generic owning-device/declared-host-buft
 relationship, without a `ROCm_Host` name check, while continuing to reject
 `CPU_Mapped`. The XDNA registration survived the intervening HIP execution and
-again reported zero weight-copy bytes. Large-model pinned-allocation failure
-and immutable-buffer free-time eviction remain open productization gates.
+again reported zero weight-copy bytes.
+Large-model pinned-allocation failure remains an open productization gate; serialized immutable-buffer free-time eviction now passes the exact-address regression described above.
 
 The local `stories15M-q4_0.gguf` is a real 24.41-million-parameter, six-layer
 Llama model with embedding width 288. A graph exported by the current
@@ -685,16 +681,10 @@ contract. Each admitted shape remains a registry entry with its own worker/DMA
 geometry and correctness tolerance; it does not add shape switches to GGML or
 the XDNA runtime.
 
-The measured regimes now separate cleanly: 288x288 and 512x2560 are dominated
-by the command envelope, while 10240x2560 exposes sustained kernel/dataflow
-throughput. The next high-value questions are whether compute-tile codegen or a
-safe explicit ping-pong topology can move beyond 19.25 GB/s, whether the model
-loader can provision large `ROCm_Host` allocations reliably, and how to attach
-XRT registration eviction to the backing buffer's actual lifetime. Depth-two
-forwarding remains disabled; four-wave depth-one task groups are the largest
-stress-tested controller batch, while an eight-wave batch hung under sustained
-load. AIE2 requires its own implementation and is not inferred from the tested
-AIE2P kernel.
+The measured regimes now separate cleanly: 288x288 and 512x2560 are dominated by the command envelope, while 10240x2560 exposes sustained kernel/dataflow throughput.
+The next high-value questions are whether compute-tile codegen or a safe explicit ping-pong topology can move beyond 19.25 GB/s, whether the model loader can provision large `ROCm_Host` allocations reliably, whether the read-only mmap gate passes after a driver upgrade, and whether concurrent compute/free/teardown can be given a safe contract.
+Depth-two forwarding remains disabled; four-wave depth-one task groups are the largest stress-tested controller batch, while an eight-wave batch hung under sustained load.
+AIE2 requires its own implementation and is not inferred from the tested AIE2P kernel.
 
 ## Go/no-go checkpoint
 
@@ -703,9 +693,9 @@ AIE2P kernel.
 | Clean ACCEL registration and discovery? | **GO**: dynamic `XDNA0`, real XRT/plugin/device-node path. |
 | Real GGML `MUL_MAT` on XDNA? | **GO for fixed Q4_0 and BF16 shapes**; CPU comparisons pass and a real GGUF `Qcur-0` node executed. |
 | Fundamentally UMA/system-backed weights? | **GO for writable CPU and `ROCm_Host` allocations**: a physical HIP/XDNA probe consumed the same page-aligned system-memory weight pointer, with one XRT registration and no secondary weight copy. |
-| Reuse without per-token weight copy? | **GO for model-lifetime immutable buffers**: persistent parent/view/run, constant registrations, zero weight-copy bytes. Mutable/test weights use one explicit native-byte staging copy per call. **NO for arbitrary immutable-buffer lifetimes** until registration ownership moves into an XDNA buffer type. |
-| Ordinary read-only GGUF mmap? | **NO on the installed driver, fail-closed automatically**: an actual file-backed `PROT_READ` XRT userptr parent, nonzero-offset child, and TO_DEVICE sync gate `mmap_support` and exact `CPU_Mapped` acceptance. Upstream driver commit `ed8fb2dd172bde623d7112a1bd674fc0e3c4cae4` contains the required read-only pin/IOMMU path, but it is not installed or physically validated here. |
-| Quantized batch-one GEMV? | **GO for native 288x288, 512x2560, and 10240x2560 Q4_0**. All three registered variants pass together in one physical backend instance; the production variants reach 6.91 and 19.25 GB/s without repacking or a secondary immutable-weight copy. Broader dtype/shape coverage remains open. |
+| Reuse without per-token weight copy? | **GO for serialized immutable-buffer lifetimes**: persistent parent/view/run reuse has zero weight-copy bytes, and observer-driven eviction passes exact owner/base/data ABA reuse with two registrations and no hits. Mutable/test weights use one explicit native-byte staging copy per call. Concurrent compute/free/backend teardown is not claimed. |
+| Ordinary read-only GGUF mmap? | **NO on the installed driver, fail-closed automatically**: the complete file-backed `PROT_READ` parent/subview/sync probe fails with errno 12, leaving `mmap_support` and `CPU_Mapped` acceptance disabled. Upstream driver commit `ed8fb2dd172bde623d7112a1bd674fc0e3c4cae4` contains the required read-only pin/IOMMU path; only a successful post-upgrade runtime probe enables the positive path, which is not physically validated here. |
+| Quantized batch-one GEMV? | **GO for native 288x288, 512x2560, and 10240x2560 Q4_0 plus the 288x288 BF16 reference**. All four registered variants pass together in one physical backend instance; the production variants reach 6.91 and 19.25 GB/s without repacking or a secondary immutable-weight copy. Broader dtype/shape coverage remains open. |
 | ROCm comparison and hybrid value? | **Capability scheduling, shared weights, and a real small-GGUF hybrid graph GO; performance NO-GO for the measured isolated shapes.** Normal `[ROCm,XDNA,CPU]` order keeps `pp32` off XDNA and executes 48 XDNA projections for `tg2` from one `ROCm_Host` model allocation, with persistent page-window registrations and zero immutable-weight copy. Fair synchronized HIP is about 4.4-5.0x faster at 512x2560 and 4.7-4.9x at 10240x2560; HIP is about 12x faster at 288x288. Fused K/V saves one XDNA command floor but remains slower than HIP, and the tested gate/up pair is slower than two optimized XDNA calls. No end-to-end hybrid performance win is claimed. |
 | NPU utilization and energy? | **OPEN**: installed XRT/sysfs exposes neither a per-kernel utilization/energy counter nor estimated NPU power (`Estimated Power: N/A`); external SoC telemetry is required. |
 
