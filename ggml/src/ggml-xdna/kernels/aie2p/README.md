@@ -109,10 +109,24 @@ than finishing one task group per wave. Eight-wave groups were faster in a
 101-call test but hung during the sustained run and are deliberately rejected;
 twenty waves exhaust shim BD IDs during lowering. A 15-weight-stream experiment
 was also slower and nearly doubled the controller instruction stream, so it is
-not included. This result used MLIR-AIE 1.3.4, Peano
+not included.
+
+The shared K=2560 compute source subsequently replaced indexed three-row block
+addressing with pointer induction. An order-balanced physical A/B over 16,016
+launches was exact and reduced M=10240 mean latency from 778.872 to 765.908 us
+(1.67%, 19.25 GB/s) and M=512 from 107.844 to 106.757 us (1.01%). The Peano
+object lost 11 VLIW bundles and 80 code bytes; `-O2` and `-O3` produced
+byte-identical objects, so the build retains `-O2`.
+
+These results used MLIR-AIE 1.3.4, Peano
 `cb664e8cc3eb42a12e3ad3cee28729785ffa97a3`, and XRT 2.20.0; generated artifacts
-remain local and must be rebuilt for distribution. The physically validated
-ABI-v1 bundle was 189,971 bytes with SHA-256
+remain local and must be rebuilt for distribution. The original task-group
+stress artifact was an ABI-v1 189,971-byte bundle with SHA-256
 `d51bc1954a357b105bb2a6f294b5208b7143767f5318ac0ccb3e660bdd0e5c9e`;
 its 45,620-byte instruction stream has SHA-256
 `72d2c1961c729a4c75733ac081b433f29ec885e8e6bacf720cb89fe489b8e913`.
+The current pointer-induction M=10240 rebuild keeps that instruction stream,
+is 187,411 bytes, and has SHA-256
+`3d911dfbf792c9e1eae13c73bf15abe41533f5793df995931302424c67483605`.
+The corresponding current M=512 bundle has SHA-256
+`040d2d30463f990be44aa40449cc1066628476f3451e2fb966b502c144cedf3e`.

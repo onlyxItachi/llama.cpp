@@ -78,17 +78,19 @@ __aie_inline void dot_rows_3(
     auto acc0 = aie::zeros<accfloat, 32>();
     auto acc1 = aie::zeros<accfloat, 32>();
     auto acc2 = aie::zeros<accfloat, 32>();
+    const uint8_t * weight0 = weights;
+    const uint8_t * weight1 = weights + kRowBytes;
+    const uint8_t * weight2 = weights + 2 * kRowBytes;
+    const bfloat16 * activation_block = activation;
     for (int block_index = 0; block_index < kBlocksPerRow; ++block_index) {
-        const auto x = aie::load_v<32>(activation + block_index * kBlockValues);
-        acc0 = aie::mac(acc0, dequantize_block(weights + block_index * kBlockBytes, false), x);
-        acc1 = aie::mac(
-            acc1,
-            dequantize_block(weights + kRowBytes + block_index * kBlockBytes, false),
-            x);
-        acc2 = aie::mac(
-            acc2,
-            dequantize_block(weights + 2 * kRowBytes + block_index * kBlockBytes, false),
-            x);
+        const auto x = aie::load_v<32>(activation_block);
+        acc0 = aie::mac(acc0, dequantize_block(weight0, false), x);
+        acc1 = aie::mac(acc1, dequantize_block(weight1, false), x);
+        acc2 = aie::mac(acc2, dequantize_block(weight2, false), x);
+        weight0 += kBlockBytes;
+        weight1 += kBlockBytes;
+        weight2 += kBlockBytes;
+        activation_block += kBlockValues;
     }
     output[0] = aie::reduce_add<float>(acc0);
     output[1] = aie::reduce_add<float>(acc1);
