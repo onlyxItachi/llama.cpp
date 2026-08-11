@@ -93,6 +93,13 @@ ggml_backend_dev_t ggml_backend_buft_get_device(ggml_backend_buffer_type_t buft)
 
 // backend buffer
 
+struct ggml_backend_buffer_observer {
+    ggml_backend_buffer_t buffer;
+    ggml_backend_buffer_free_callback_t callback;
+    void * user_data;
+    ggml_backend_buffer_observer_t next;
+};
+
 ggml_backend_buffer_t ggml_backend_buffer_init(
                ggml_backend_buffer_type_t buft,
         struct ggml_backend_buffer_i      iface,
@@ -103,10 +110,51 @@ ggml_backend_buffer_t ggml_backend_buffer_init(
         /* .buft      = */ buft,
         /* .context   = */ context,
         /* .size      = */ size,
-        /* .usage     = */ GGML_BACKEND_BUFFER_USAGE_ANY
+        /* .usage     = */ GGML_BACKEND_BUFFER_USAGE_ANY,
+        /* .free_observers = */ nullptr,
+        /* .is_freeing     = */ false,
     };
 
     return buffer;
+}
+
+ggml_backend_buffer_observer_t ggml_backend_buffer_add_free_observer(
+        ggml_backend_buffer_t buffer,
+        ggml_backend_buffer_free_callback_t callback,
+        void * user_data) {
+    GGML_ASSERT(buffer != nullptr);
+    GGML_ASSERT(callback != nullptr);
+    GGML_ASSERT(!buffer->is_freeing);
+
+    auto * observer = new ggml_backend_buffer_observer {
+        /* .buffer    = */ buffer,
+        /* .callback  = */ callback,
+        /* .user_data = */ user_data,
+        /* .next      = */ buffer->free_observers,
+    };
+    buffer->free_observers = observer;
+    return observer;
+}
+
+void ggml_backend_buffer_remove_free_observer(ggml_backend_buffer_observer_t observer) {
+    if (observer == nullptr) {
+        return;
+    }
+
+    ggml_backend_buffer_t buffer = observer->buffer;
+    GGML_ASSERT(buffer != nullptr);
+    GGML_ASSERT(!buffer->is_freeing);
+
+    ggml_backend_buffer_observer_t * current = &buffer->free_observers;
+    while (*current != nullptr && *current != observer) {
+        current = &(*current)->next;
+    }
+    GGML_ASSERT(*current == observer);
+
+    *current = observer->next;
+    observer->buffer = nullptr;
+    observer->next = nullptr;
+    delete observer;
 }
 
 const char * ggml_backend_buffer_name(ggml_backend_buffer_t buffer) {
@@ -116,6 +164,22 @@ const char * ggml_backend_buffer_name(ggml_backend_buffer_t buffer) {
 void ggml_backend_buffer_free(ggml_backend_buffer_t buffer) {
     if (buffer == NULL) {
         return;
+    }
+
+    GGML_ASSERT(!buffer->is_freeing);
+    buffer->is_freeing = true;
+
+    // Detach the complete list before invoking foreign-backend callbacks. The
+    // backing allocation remains valid until every observer has returned.
+    ggml_backend_buffer_observer_t observer = buffer->free_observers;
+    buffer->free_observers = nullptr;
+    while (observer != nullptr) {
+        ggml_backend_buffer_observer_t next = observer->next;
+        observer->buffer = nullptr;
+        observer->next = nullptr;
+        observer->callback(buffer, observer->user_data);
+        delete observer;
+        observer = next;
     }
 
     if (buffer->iface.free_buffer != NULL) {

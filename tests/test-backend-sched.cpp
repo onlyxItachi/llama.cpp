@@ -201,6 +201,81 @@ static void require(bool condition, const char * message) {
     }
 }
 
+struct buffer_observer_test_state {
+    int sequence = 0;
+    int provider_calls = 0;
+    int provider_order = 0;
+    int observer_calls[3] = {};
+    int observer_order[3] = {};
+};
+
+struct buffer_observer_test_data {
+    buffer_observer_test_state * state;
+    size_t index;
+};
+
+static void buffer_observer_test_provider_free(ggml_backend_buffer_t buffer) {
+    auto * state = static_cast<buffer_observer_test_state *>(buffer->context);
+    state->provider_calls++;
+    state->provider_order = ++state->sequence;
+}
+
+static void buffer_observer_test_callback(ggml_backend_buffer_t buffer, void * user_data) {
+    auto * data = static_cast<buffer_observer_test_data *>(user_data);
+    require(buffer->context == data->state, "observer received the wrong buffer");
+    require(buffer->free_observers == nullptr, "observer list was not detached before notification");
+    require(buffer->is_freeing, "buffer was not marked as freeing before notification");
+    require(data->state->provider_calls == 0, "provider freed its allocation before observer notification");
+    data->state->observer_calls[data->index]++;
+    data->state->observer_order[data->index] = ++data->state->sequence;
+}
+
+static void test_buffer_free_observers() {
+    ggml_backend_buffer_type buft = make_mock_buffer_type(true);
+    buffer_observer_test_state state;
+    buffer_observer_test_data observer_data[] = {
+        { &state, 0 },
+        { &state, 1 },
+        { &state, 2 },
+    };
+
+    static const ggml_backend_buffer_i iface = {
+        /* .free_buffer     = */ buffer_observer_test_provider_free,
+        /* .get_base        = */ nullptr,
+        /* .init_tensor     = */ nullptr,
+        /* .memset_tensor   = */ nullptr,
+        /* .set_tensor      = */ nullptr,
+        /* .get_tensor      = */ nullptr,
+        /* .set_tensor_2d   = */ nullptr,
+        /* .get_tensor_2d   = */ nullptr,
+        /* .cpy_tensor      = */ nullptr,
+        /* .clear           = */ nullptr,
+        /* .reset           = */ nullptr,
+    };
+
+    ggml_backend_buffer_t buffer = ggml_backend_buffer_init(&buft, iface, &state, 0);
+    require(buffer != nullptr, "failed to create observer test buffer");
+
+    ggml_backend_buffer_observer_t observer_0 =
+            ggml_backend_buffer_add_free_observer(buffer, buffer_observer_test_callback, &observer_data[0]);
+    ggml_backend_buffer_observer_t observer_1 =
+            ggml_backend_buffer_add_free_observer(buffer, buffer_observer_test_callback, &observer_data[1]);
+    ggml_backend_buffer_observer_t observer_2 =
+            ggml_backend_buffer_add_free_observer(buffer, buffer_observer_test_callback, &observer_data[2]);
+    require(observer_0 != nullptr && observer_1 != nullptr && observer_2 != nullptr,
+            "failed to create buffer observers");
+
+    ggml_backend_buffer_remove_free_observer(observer_1);
+    ggml_backend_buffer_free(buffer);
+
+    require(state.observer_calls[0] == 1, "first observer was not called exactly once");
+    require(state.observer_calls[1] == 0, "removed observer was called");
+    require(state.observer_calls[2] == 1, "second active observer was not called exactly once");
+    require(state.provider_calls == 1, "provider free callback was not called exactly once");
+    require(state.observer_order[0] < state.provider_order && state.observer_order[2] < state.provider_order,
+            "provider free callback ran before an observer");
+}
+
 enum class memory_kind {
     host,
     device,
@@ -410,6 +485,8 @@ static void test_accel_offload_preference(
 }
 
 int main() {
+    test_buffer_free_observers();
+
     const enum ggml_backend_dev_type target_types[] = {
         GGML_BACKEND_DEVICE_TYPE_GPU,
         GGML_BACKEND_DEVICE_TYPE_IGPU,

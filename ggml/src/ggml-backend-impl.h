@@ -43,6 +43,10 @@ extern "C" {
     // Backend buffer
     //
 
+    struct ggml_backend_buffer_observer;
+    typedef struct ggml_backend_buffer_observer * ggml_backend_buffer_observer_t;
+    typedef void (*ggml_backend_buffer_free_callback_t)(ggml_backend_buffer_t buffer, void * user_data);
+
     struct ggml_backend_buffer_i {
         // (optional) free the buffer
         void         (*free_buffer)  (ggml_backend_buffer_t buffer);
@@ -72,6 +76,8 @@ extern "C" {
         void * context;
         size_t size;
         enum ggml_backend_buffer_usage usage;
+        ggml_backend_buffer_observer_t free_observers;
+        bool is_freeing;
     };
 
     GGML_API ggml_backend_buffer_t ggml_backend_buffer_init(
@@ -79,6 +85,16 @@ extern "C" {
             struct ggml_backend_buffer_i      iface,
                    void *                     context,
                    size_t                     size);
+
+    // Observe destruction of a buffer owned by another backend. Add/remove/free calls for a buffer must be
+    // serialized by the caller. When a buffer is freed, all observers are detached and then invoked before
+    // iface.free_buffer releases the underlying allocation. Callbacks must not add or remove observers for the
+    // buffer and must not throw. An observer handle becomes invalid after either removal or callback invocation.
+    GGML_API ggml_backend_buffer_observer_t ggml_backend_buffer_add_free_observer(
+            ggml_backend_buffer_t buffer,
+            ggml_backend_buffer_free_callback_t callback,
+            void * user_data);
+    GGML_API void ggml_backend_buffer_remove_free_observer(ggml_backend_buffer_observer_t observer);
 
     // do not use directly, use ggml_backend_tensor_copy instead
     GGML_API bool ggml_backend_buffer_copy_tensor(const struct ggml_tensor * src, struct ggml_tensor * dst);
