@@ -41,11 +41,14 @@ explicit overrides for nonstandard environments.
 Run `make clean` before changing the compiler/toolchain path; Make cannot infer
 toolchain identity changes from timestamps alone.
 
-The Q4_0 kernel decodes the exact IEEE FP16 scale and packed `q - 8` values
-on-tile without a dequantized weight copy. Peano lowers its inner Q4 path to
-AIE2P vector loads, unpack/shuffle, conversion, multiply and reduction. The
-last packed block in each FIFO object is staged through an aligned local buffer
-because the fast unaligned vector primitive may issue wider surrounding loads.
-The remaining single-worker performance work is to remove the per-block scalar
-FP32 helper dependency without violating the GGML numerical contract, then
-distribute output rows over multiple workers.
+The Q4_0 kernel decodes the IEEE FP16 scale bits and packed `q - 8` values
+on-tile without a dequantized weight copy. AIE2P/arch21 has no native IEEE-FP16
+arithmetic, so the decoded scale is rounded to BF16 before vector dequantization;
+the backend correctness tolerance covers that explicit numerical contract.
+Peano lowers the inner Q4 path to AIE2P vector loads, unpack/shuffle,
+conversion, multiply/MAC and reduction without scalar soft-float helpers.
+Three row accumulators reuse each activation vector load; four rows were slower
+because the pinned compiler spills vector state. The last packed block in each
+FIFO object is staged through an aligned local buffer because the fast
+unaligned vector primitive may issue wider surrounding loads. The remaining
+performance step is to distribute output rows over multiple workers.

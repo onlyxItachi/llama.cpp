@@ -67,20 +67,49 @@ __aie_inline aie::vector<int8, 32> unpack_q4_0(const uint8_t * packed, bool safe
     return aie::sub(q8_natural, int8_t(8));
 }
 
-__aie_inline float dot_row(const uint8_t * weights, const bfloat16 * activation, bool final_row) {
-    float sum = 0.0f;
-    for (int block_index = 0; block_index < 9; ++block_index) {
-        const uint8_t * block = weights + block_index * 18;
-        const auto q_bf16 = aie::to_float<bfloat16>(
-            unpack_q4_0(block + 2, final_row && block_index == 8));
-        const auto x = aie::load_v<32>(activation + block_index * 32);
-        const float dot = aie::reduce_add<float>(aie::mul(q_bf16, x));
+__aie_inline aie::vector<bfloat16, 32> dequantize_block(
+        const uint8_t * block, bool safe_tail) {
+    const auto q_bf16 = aie::to_float<bfloat16>(unpack_q4_0(block + 2, safe_tail));
+    const uint16_t scale_bits = static_cast<uint16_t>(block[0]) |
+                                (static_cast<uint16_t>(block[1]) << 8u);
+    // AIE2P/arch21 has no native IEEE-fp16 arithmetic. Decode the GGML scale
+    // exactly, then round it to BF16 so scaling and accumulation remain on the
+    // vector datapath instead of calling a scalar soft-float multiply helper.
+    const bfloat16 scale = static_cast<bfloat16>(fp16_to_fp32(scale_bits));
+    return aie::mul(
+        q_bf16, aie::broadcast<bfloat16, 32>(scale)).template to_vector<bfloat16>();
+}
 
-        const uint16_t scale_bits = static_cast<uint16_t>(block[0]) |
-                                    (static_cast<uint16_t>(block[1]) << 8u);
-        sum += fp16_to_fp32(scale_bits) * dot;
+__aie_inline void dot_rows_3(
+        const uint8_t * weights, const bfloat16 * activation, float * output) {
+    auto acc0 = aie::zeros<accfloat, 32>();
+    auto acc1 = aie::zeros<accfloat, 32>();
+    auto acc2 = aie::zeros<accfloat, 32>();
+    for (int block_index = 0; block_index < 9; ++block_index) {
+        const auto x = aie::load_v<32>(activation + block_index * 32);
+        acc0 = aie::mac(acc0, dequantize_block(weights + block_index * 18, false), x);
+        acc1 = aie::mac(acc1, dequantize_block(weights + 162 + block_index * 18, false), x);
+        acc2 = aie::mac(acc2, dequantize_block(weights + 324 + block_index * 18, false), x);
     }
-    return sum;
+    output[0] = aie::reduce_add<float>(acc0);
+    output[1] = aie::reduce_add<float>(acc1);
+    output[2] = aie::reduce_add<float>(acc2);
+}
+
+__aie_inline void dot_final_rows_2(
+        const uint8_t * weights, const bfloat16 * activation, float * output) {
+    auto acc0 = aie::zeros<accfloat, 32>();
+    auto acc1 = aie::zeros<accfloat, 32>();
+    for (int block_index = 0; block_index < 9; ++block_index) {
+        const auto x = aie::load_v<32>(activation + block_index * 32);
+        acc0 = aie::mac(acc0, dequantize_block(weights + block_index * 18, false), x);
+        acc1 = aie::mac(
+            acc1,
+            dequantize_block(weights + 162 + block_index * 18, block_index == 8),
+            x);
+    }
+    output[0] = aie::reduce_add<float>(acc0);
+    output[1] = aie::reduce_add<float>(acc1);
 }
 
 } // namespace
@@ -90,9 +119,13 @@ extern "C" {
 // Each input object contains 32 complete GGML rows. A row holds nine
 // block_q4_0 values; each block is an LE fp16 scale plus 16 packed bytes.
 void gemv_q4_0_bf16_f32(const uint8_t * weights, const bfloat16 * activation, float * output) {
-    for (int row = 0; row < 32; ++row) {
-        output[row] = dot_row(weights + row * 162, activation, row == 31);
+    // Three independent row accumulators reuse each activation vector load.
+    // Four rows spill vector state with the pinned Peano toolchain; the final
+    // two rows also provide the exact-load boundary case for the FIFO object.
+    for (int row = 0; row < 30; row += 3) {
+        dot_rows_3(weights + row * 162, activation, output + row);
     }
+    dot_final_rows_2(weights + 30 * 162, activation, output + 30);
 }
 
 }
