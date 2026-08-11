@@ -42,8 +42,9 @@ static const char * ggml_backend_xdna_name(ggml_backend_t backend) {
 
 static void ggml_backend_xdna_free(ggml_backend_t backend) {
     auto * ctx = static_cast<xdna_backend_context *>(backend->context);
-    ggml_backend_xdna_stats stats = {};
-    ctx->runtime.get_stats(&stats);
+    ggml_backend_xdna_stats_v2 stats_v2 = {};
+    ctx->runtime.get_stats_v2(&stats_v2);
+    const ggml_backend_xdna_stats & stats = stats_v2.base;
     GGML_LOG_INFO(
             "ggml_xdna: init_ms=%.3f submissions=%" PRIu64 " first_kernel_ms=%.3f "
             "first_total_ms=%.3f kernel_ms=%.3f total_ms=%.3f "
@@ -80,6 +81,31 @@ static void ggml_backend_xdna_free(ggml_backend_t backend) {
             stats.host_copy_calls,
             stats.host_copy_bytes,
             stats.host_copy_time_ns / 1.0e6);
+    GGML_LOG_INFO(
+            "ggml_xdna: successful_calls=%" PRIu64 " start=%" PRIu64 "/%.3fms wait=%" PRIu64 "/%.3fms "
+            "first_start_ms=%.3f first_wait_ms=%.3f activation_pack=%" PRIu64 "/%" PRIu64 "B->%" PRIu64 "B/%.3fms "
+            "activation_sync=%" PRIu64 "/%" PRIu64 "B/%.3fms output_sync=%" PRIu64 "/%" PRIu64 "B/%.3fms "
+            "output_copy=%" PRIu64 "/%" PRIu64 "B/%.3fms\n",
+            stats_v2.successful_compute_calls,
+            stats_v2.run_start_calls,
+            stats_v2.run_start_time_ns / 1.0e6,
+            stats_v2.run_wait_calls,
+            stats_v2.run_wait_time_ns / 1.0e6,
+            stats_v2.first_run_start_time_ns / 1.0e6,
+            stats_v2.first_run_wait_time_ns / 1.0e6,
+            stats_v2.activation_pack_calls,
+            stats_v2.activation_pack_input_bytes,
+            stats_v2.activation_pack_output_bytes,
+            stats_v2.activation_pack_time_ns / 1.0e6,
+            stats_v2.activation_sync_calls,
+            stats_v2.activation_sync_bytes,
+            stats_v2.activation_sync_time_ns / 1.0e6,
+            stats_v2.output_sync_calls,
+            stats_v2.output_sync_bytes,
+            stats_v2.output_sync_time_ns / 1.0e6,
+            stats_v2.output_copy_calls,
+            stats_v2.output_copy_bytes,
+            stats_v2.output_copy_time_ns / 1.0e6);
     delete ctx;
     delete backend;
 }
@@ -306,7 +332,14 @@ static ggml_backend_dev_t ggml_backend_xdna_reg_get_device(ggml_backend_reg_t re
 
 static void * ggml_backend_xdna_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
-    GGML_UNUSED(name);
+    if (std::strcmp(name, "ggml_backend_xdna_get_stats") == 0) {
+        ggml_backend_xdna_get_stats_t fct = ggml_backend_xdna_get_stats;
+        return (void *) fct;
+    }
+    if (std::strcmp(name, "ggml_backend_xdna_get_stats_v2") == 0) {
+        ggml_backend_xdna_get_stats_v2_t fct = ggml_backend_xdna_get_stats_v2;
+        return (void *) fct;
+    }
     return nullptr;
 }
 
@@ -338,6 +371,18 @@ bool ggml_backend_xdna_get_stats(ggml_backend_t backend, ggml_backend_xdna_stats
     }
     auto * ctx = static_cast<xdna_backend_context *>(backend->context);
     ctx->runtime.get_stats(stats);
+    return true;
+}
+
+bool ggml_backend_xdna_get_stats_v2(
+        ggml_backend_t backend,
+        ggml_backend_xdna_stats_v2 * stats,
+        size_t stats_size) {
+    if (!ggml_backend_is_xdna(backend) || stats == nullptr || stats_size < sizeof(*stats)) {
+        return false;
+    }
+    auto * ctx = static_cast<xdna_backend_context *>(backend->context);
+    ctx->runtime.get_stats_v2(stats);
     return true;
 }
 

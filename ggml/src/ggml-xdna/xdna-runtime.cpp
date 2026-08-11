@@ -479,6 +479,26 @@ struct runtime::impl {
     std::atomic<uint64_t> first_compute_time_ns { 0 };
     std::atomic<uint64_t> kernel_time_ns { 0 };
     std::atomic<uint64_t> total_compute_time_ns { 0 };
+    std::atomic<uint64_t> successful_compute_calls { 0 };
+    std::atomic<uint64_t> activation_pack_calls { 0 };
+    std::atomic<uint64_t> activation_pack_input_bytes { 0 };
+    std::atomic<uint64_t> activation_pack_output_bytes { 0 };
+    std::atomic<uint64_t> activation_pack_time_ns { 0 };
+    std::atomic<uint64_t> activation_sync_calls { 0 };
+    std::atomic<uint64_t> activation_sync_bytes { 0 };
+    std::atomic<uint64_t> activation_sync_time_ns { 0 };
+    std::atomic<uint64_t> run_start_calls { 0 };
+    std::atomic<uint64_t> run_start_time_ns { 0 };
+    std::atomic<uint64_t> run_wait_calls { 0 };
+    std::atomic<uint64_t> run_wait_time_ns { 0 };
+    std::atomic<uint64_t> first_run_start_time_ns { 0 };
+    std::atomic<uint64_t> first_run_wait_time_ns { 0 };
+    std::atomic<uint64_t> output_sync_calls { 0 };
+    std::atomic<uint64_t> output_sync_bytes { 0 };
+    std::atomic<uint64_t> output_sync_time_ns { 0 };
+    std::atomic<uint64_t> output_copy_calls { 0 };
+    std::atomic<uint64_t> output_copy_bytes { 0 };
+    std::atomic<uint64_t> output_copy_time_ns { 0 };
 };
 
 runtime::runtime(const device_info & info, const kernel_configuration & configuration) {
@@ -533,30 +553,48 @@ int runtime::compute(ggml_tensor * op) noexcept {
         }
         xrt::bo & weight_bo = pimpl->register_weight(op->src[0]);
 
-        const auto host_copy_start = std::chrono::steady_clock::now();
+        const auto activation_pack_start = std::chrono::steady_clock::now();
         ggml_fp32_to_bf16_row(
             static_cast<const float *>(op->src[1]->data),
             static_cast<ggml_bf16_t *>(pimpl->state->activation_data),
             variant.k * variant.n);
-        pimpl->host_copy_time_ns.fetch_add(
-            elapsed_ns(host_copy_start, std::chrono::steady_clock::now()));
+        const uint64_t activation_pack_ns = elapsed_ns(
+            activation_pack_start, std::chrono::steady_clock::now());
+        pimpl->activation_pack_calls.fetch_add(1);
+        pimpl->activation_pack_input_bytes.fetch_add(ggml_nbytes(op->src[1]));
+        pimpl->activation_pack_output_bytes.fetch_add(variant.device_activation_bytes);
+        pimpl->activation_pack_time_ns.fetch_add(activation_pack_ns);
         pimpl->host_copy_calls.fetch_add(1);
         pimpl->host_copy_bytes.fetch_add(variant.device_activation_bytes);
+        pimpl->host_copy_time_ns.fetch_add(activation_pack_ns);
+
         const auto activation_sync_start = std::chrono::steady_clock::now();
         pimpl->state->activation_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE, variant.device_activation_bytes, 0);
-        pimpl->sync_to_device_time_ns.fetch_add(
-            elapsed_ns(activation_sync_start, std::chrono::steady_clock::now()));
+        const uint64_t activation_sync_ns = elapsed_ns(
+            activation_sync_start, std::chrono::steady_clock::now());
+        pimpl->activation_sync_calls.fetch_add(1);
+        pimpl->activation_sync_bytes.fetch_add(variant.device_activation_bytes);
+        pimpl->activation_sync_time_ns.fetch_add(activation_sync_ns);
         pimpl->sync_to_device_calls.fetch_add(1);
         pimpl->sync_to_device_bytes.fetch_add(variant.device_activation_bytes);
+        pimpl->sync_to_device_time_ns.fetch_add(activation_sync_ns);
         host_memory_fence();
 
         pimpl->state->run->set_arg(3, weight_bo);
-        const auto kernel_start = std::chrono::steady_clock::now();
+        const auto run_start_begin = std::chrono::steady_clock::now();
         pimpl->state->run->start();
+        const auto run_start_end = std::chrono::steady_clock::now();
         const ert_cmd_state state = pimpl->state->run->wait();
-        const auto kernel_stop = std::chrono::steady_clock::now();
-        const uint64_t submission = pimpl->kernel_submissions.fetch_add(1) + 1;
-        const uint64_t kernel_ns = elapsed_ns(kernel_start, kernel_stop);
+        const auto run_wait_end = std::chrono::steady_clock::now();
+        const uint64_t run_start_ns = elapsed_ns(run_start_begin, run_start_end);
+        const uint64_t run_wait_ns = elapsed_ns(run_start_end, run_wait_end);
+        pimpl->run_start_calls.fetch_add(1);
+        pimpl->run_start_time_ns.fetch_add(run_start_ns);
+        pimpl->run_wait_calls.fetch_add(1);
+        pimpl->run_wait_time_ns.fetch_add(run_wait_ns);
+
+        pimpl->kernel_submissions.fetch_add(1);
+        const uint64_t kernel_ns = run_start_ns + run_wait_ns;
         pimpl->kernel_time_ns.fetch_add(kernel_ns);
         if (state != ERT_CMD_STATE_COMPLETED) {
             GGML_LOG_ERROR("ggml_xdna: kernel returned ERT state %d\n", static_cast<int>(state));
@@ -565,22 +603,33 @@ int runtime::compute(ggml_tensor * op) noexcept {
 
         const auto output_sync_start = std::chrono::steady_clock::now();
         pimpl->state->output_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE, variant.device_output_bytes, 0);
-        pimpl->sync_from_device_time_ns.fetch_add(
-            elapsed_ns(output_sync_start, std::chrono::steady_clock::now()));
+        const uint64_t output_sync_ns = elapsed_ns(
+            output_sync_start, std::chrono::steady_clock::now());
+        pimpl->output_sync_calls.fetch_add(1);
+        pimpl->output_sync_bytes.fetch_add(variant.device_output_bytes);
+        pimpl->output_sync_time_ns.fetch_add(output_sync_ns);
         pimpl->sync_from_device_calls.fetch_add(1);
         pimpl->sync_from_device_bytes.fetch_add(variant.device_output_bytes);
+        pimpl->sync_from_device_time_ns.fetch_add(output_sync_ns);
         host_memory_fence();
 
         const auto output_copy_start = std::chrono::steady_clock::now();
         std::memcpy(op->data, pimpl->state->output_data, variant.device_output_bytes);
-        pimpl->host_copy_time_ns.fetch_add(
-            elapsed_ns(output_copy_start, std::chrono::steady_clock::now()));
+        const uint64_t output_copy_ns = elapsed_ns(
+            output_copy_start, std::chrono::steady_clock::now());
+        pimpl->output_copy_calls.fetch_add(1);
+        pimpl->output_copy_bytes.fetch_add(variant.device_output_bytes);
+        pimpl->output_copy_time_ns.fetch_add(output_copy_ns);
         pimpl->host_copy_calls.fetch_add(1);
         pimpl->host_copy_bytes.fetch_add(variant.device_output_bytes);
+        pimpl->host_copy_time_ns.fetch_add(output_copy_ns);
 
         const uint64_t total_ns = elapsed_ns(total_start, std::chrono::steady_clock::now());
         pimpl->total_compute_time_ns.fetch_add(total_ns);
-        if (submission == 1) {
+        const uint64_t success = pimpl->successful_compute_calls.fetch_add(1) + 1;
+        if (success == 1) {
+            pimpl->first_run_start_time_ns.store(run_start_ns);
+            pimpl->first_run_wait_time_ns.store(run_wait_ns);
             pimpl->first_kernel_time_ns.store(kernel_ns);
             pimpl->first_compute_time_ns.store(total_ns);
             GGML_LOG_INFO(
@@ -629,6 +678,30 @@ void runtime::get_stats(ggml_backend_xdna_stats * stats) const noexcept {
     stats->first_compute_time_ns = pimpl->first_compute_time_ns.load();
     stats->kernel_time_ns = pimpl->kernel_time_ns.load();
     stats->total_compute_time_ns = pimpl->total_compute_time_ns.load();
+}
+
+void runtime::get_stats_v2(ggml_backend_xdna_stats_v2 * stats) const noexcept {
+    get_stats(&stats->base);
+    stats->successful_compute_calls = pimpl->successful_compute_calls.load();
+    stats->activation_pack_calls = pimpl->activation_pack_calls.load();
+    stats->activation_pack_input_bytes = pimpl->activation_pack_input_bytes.load();
+    stats->activation_pack_output_bytes = pimpl->activation_pack_output_bytes.load();
+    stats->activation_pack_time_ns = pimpl->activation_pack_time_ns.load();
+    stats->activation_sync_calls = pimpl->activation_sync_calls.load();
+    stats->activation_sync_bytes = pimpl->activation_sync_bytes.load();
+    stats->activation_sync_time_ns = pimpl->activation_sync_time_ns.load();
+    stats->run_start_calls = pimpl->run_start_calls.load();
+    stats->run_start_time_ns = pimpl->run_start_time_ns.load();
+    stats->run_wait_calls = pimpl->run_wait_calls.load();
+    stats->run_wait_time_ns = pimpl->run_wait_time_ns.load();
+    stats->first_run_start_time_ns = pimpl->first_run_start_time_ns.load();
+    stats->first_run_wait_time_ns = pimpl->first_run_wait_time_ns.load();
+    stats->output_sync_calls = pimpl->output_sync_calls.load();
+    stats->output_sync_bytes = pimpl->output_sync_bytes.load();
+    stats->output_sync_time_ns = pimpl->output_sync_time_ns.load();
+    stats->output_copy_calls = pimpl->output_copy_calls.load();
+    stats->output_copy_bytes = pimpl->output_copy_bytes.load();
+    stats->output_copy_time_ns = pimpl->output_copy_time_ns.load();
 }
 
 } // namespace ggml_xdna

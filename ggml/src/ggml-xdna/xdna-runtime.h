@@ -49,6 +49,7 @@ public:
     int compute(ggml_tensor * op) noexcept;
 
     void get_stats(ggml_backend_xdna_stats * stats) const noexcept;
+    void get_stats_v2(ggml_backend_xdna_stats_v2 * stats) const noexcept;
 
 private:
     struct impl;
