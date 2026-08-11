@@ -393,6 +393,30 @@ struct runtime::impl {
             run = std::move(new_run);
         }
 
+        void reset_run() noexcept {
+            run.reset();
+            bound_weight_owner = nullptr;
+        }
+
+        void abort_run_or_terminate() noexcept {
+            if (run == nullptr) {
+                return;
+            }
+
+            try {
+                // xrt::run::abort() is synchronous.  A userptr registration
+                // must never be released while a command can still access it.
+                run->abort();
+            } catch (const std::exception & e) {
+                GGML_LOG_ERROR("ggml_xdna: failed to quiesce an XRT command after an execution error: %s\n", e.what());
+                std::abort();
+            } catch (...) {
+                GGML_LOG_ERROR("ggml_xdna: failed to quiesce an XRT command after an unknown execution error\n");
+                std::abort();
+            }
+            reset_run();
+        }
+
         const xdna_kernel_variant * variant = nullptr;
         std::unique_ptr<xrt::xclbin> xclbin;
         std::unique_ptr<xrt::hw_context> context;
@@ -476,8 +500,7 @@ struct runtime::impl {
         }
         owner_observers.clear();
         for (const auto & state : states) {
-            state->run.reset();
-            state->bound_weight_owner = nullptr;
+            state->reset_run();
         }
         weights.clear();
         roots.clear();
@@ -494,8 +517,7 @@ struct runtime::impl {
         // the host allocation alive.
         for (const auto & state : self->states) {
             if (state->bound_weight_owner == buffer) {
-                state->run.reset();
-                state->bound_weight_owner = nullptr;
+                state->reset_run();
             }
         }
         self->weights.erase(
@@ -816,14 +838,36 @@ int runtime::compute(ggml_tensor * op) noexcept {
         host_memory_fence();
 
         kernel->ensure_run();
-        kernel->run->set_arg(3, weight_bo);
         kernel->bound_weight_owner =
             ggml_backend_buffer_get_usage(op->src[0]->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS ?
                 op->src[0]->buffer : nullptr;
+        try {
+            kernel->run->set_arg(3, weight_bo);
+        } catch (...) {
+            // Future module-backed kernels may fail after partially binding a
+            // BO.  Rebuild the command rather than retaining an untracked
+            // reference to borrowed storage.
+            kernel->reset_run();
+            throw;
+        }
         const auto run_start_begin = std::chrono::steady_clock::now();
-        kernel->run->start();
-        const auto run_start_end = std::chrono::steady_clock::now();
-        const ert_cmd_state state = kernel->run->wait();
+        bool submitted = false;
+        ert_cmd_state state;
+        std::chrono::steady_clock::time_point run_start_end;
+        try {
+            kernel->run->start();
+            submitted = true;
+            run_start_end = std::chrono::steady_clock::now();
+            state = kernel->run->wait();
+            submitted = false;
+        } catch (...) {
+            if (submitted) {
+                kernel->abort_run_or_terminate();
+            } else {
+                kernel->reset_run();
+            }
+            throw;
+        }
         const auto run_wait_end = std::chrono::steady_clock::now();
         const uint64_t run_start_ns = elapsed_ns(run_start_begin, run_start_end);
         const uint64_t run_wait_ns = elapsed_ns(run_start_end, run_wait_end);
@@ -837,6 +881,7 @@ int runtime::compute(ggml_tensor * op) noexcept {
         pimpl->kernel_time_ns.fetch_add(kernel_ns);
         if (state != ERT_CMD_STATE_COMPLETED) {
             GGML_LOG_ERROR("ggml_xdna: kernel returned ERT state %d\n", static_cast<int>(state));
+            kernel->reset_run();
             return -1;
         }
 
