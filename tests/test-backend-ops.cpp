@@ -1247,14 +1247,6 @@ struct test_case {
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     virtual bool use_weight_context() { return false; }
 
-    // Some accelerator backends retain registrations that refer to immutable
-    // weight buffers. A fresh backend lets such tests destroy the backend (and
-    // its registrations) before their local weight buffer is released.
-    virtual bool use_scoped_backend(ggml_backend_t backend) {
-        GGML_UNUSED(backend);
-        return false;
-    }
-
     ggml_cgraph * gf = nullptr;
     ggml_cgraph * gb = nullptr;
 
@@ -1417,16 +1409,6 @@ struct test_case {
 
         ggml_backend_buffer_ptr buf_weights(nullptr);
         ggml_backend_buffer_ptr buf(nullptr);
-        ggml_backend_ptr scoped_backend(nullptr);
-        if (use_scoped_backend(backend1)) {
-            scoped_backend.reset(ggml_backend_dev_init(ggml_backend_get_device(backend1), NULL));
-            if (scoped_backend == NULL) {
-                printf("failed to initialize scoped backend [%s] ", ggml_backend_name(backend1));
-                return test_status_t::FAIL;
-            }
-            backend1 = scoped_backend.get();
-        }
-
         if (ctx_weights) {
             buf_weights.reset(ggml_backend_alloc_ctx_tensors(ctx_weights.get(), backend1));
             if (buf_weights == NULL) {
@@ -1588,16 +1570,6 @@ struct test_case {
 
         ggml_backend_buffer_ptr buf_weights(nullptr);
         ggml_backend_buffer_ptr buf(nullptr);
-        ggml_backend_ptr scoped_backend(nullptr);
-        if (use_scoped_backend(backend)) {
-            scoped_backend.reset(ggml_backend_dev_init(ggml_backend_get_device(backend), NULL));
-            if (scoped_backend == NULL) {
-                printf("failed to initialize scoped backend\n");
-                return false;
-            }
-            backend = scoped_backend.get();
-        }
-
         if (ctx_weights) {
             buf_weights.reset(ggml_backend_alloc_ctx_tensors(ctx_weights.get(), backend));
             if (buf_weights == NULL) {
@@ -4826,10 +4798,6 @@ struct test_mul_mat_weight : public test_mul_mat {
     using test_mul_mat::build_graph;
 
     bool use_weight_context() override { return true; }
-    bool use_scoped_backend(ggml_backend_t backend) override {
-        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
-        return strcmp(ggml_backend_reg_name(reg), "XDNA") == 0;
-    }
 
     ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
         GGML_ASSERT(ctx_weights != nullptr);

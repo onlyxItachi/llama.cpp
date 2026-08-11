@@ -213,11 +213,6 @@ static ggml_backend_t ggml_backend_xdna_device_init_backend(ggml_backend_dev_t d
         GGML_LOG_INFO("ggml_xdna: initialized %s at %s (%s); %s\n",
                 dev_ctx->info.name.c_str(), dev_ctx->info.bdf.c_str(), dev_ctx->info.architecture.c_str(),
                 ctx->runtime.kernel_status().c_str());
-        if (dev_ctx->kernel_configuration.available) {
-            GGML_LOG_WARN(
-                    "ggml_xdna: experimental lifetime contract: immutable GGML weight buffers must outlive "
-                    "this backend instance\n");
-        }
         return new ggml_backend {
             /* .guid    = */ ggml_backend_xdna_guid(),
             /* .iface   = */ ggml_backend_xdna_i,

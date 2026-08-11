@@ -1,5 +1,6 @@
 #include "xdna-runtime.h"
 
+#include "ggml-backend-impl.h"
 #include "ggml-impl.h"
 #include "ggml.h"
 
@@ -10,6 +11,7 @@
 #include <xrt/xrt_kernel.h>
 #include <xrt/experimental/xrt_xclbin.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
@@ -336,6 +338,11 @@ struct runtime::impl {
         xrt::bo view;
     };
 
+    struct owner_observer {
+        ggml_backend_buffer_t owner;
+        ggml_backend_buffer_observer_t handle;
+    };
+
     struct kernel_state {
         kernel_state(xrt::device & device, const kernel_artifact_configuration & configuration) :
             variant(configuration.variant) {
@@ -367,14 +374,23 @@ struct runtime::impl {
             trace_bo = std::make_unique<xrt::bo>(
                 device, 1, xrt::bo::flags::host_only, kernel->group_id(7));
 
-            run = std::make_unique<xrt::run>(*kernel);
-            run->set_arg(0, selected.runtime_opcode);
-            run->set_arg(1, *instruction_bo);
-            run->set_arg(2, instructions.size());
-            run->set_arg(4, *activation_bo);
-            run->set_arg(5, *output_bo);
-            run->set_arg(6, *temporary_bo);
-            run->set_arg(7, *trace_bo);
+            ensure_run();
+        }
+
+        void ensure_run() {
+            if (run != nullptr) {
+                return;
+            }
+
+            auto new_run = std::make_unique<xrt::run>(*kernel);
+            new_run->set_arg(0, variant->runtime_opcode);
+            new_run->set_arg(1, *instruction_bo);
+            new_run->set_arg(2, instructions.size());
+            new_run->set_arg(4, *activation_bo);
+            new_run->set_arg(5, *output_bo);
+            new_run->set_arg(6, *temporary_bo);
+            new_run->set_arg(7, *trace_bo);
+            run = std::move(new_run);
         }
 
         const xdna_kernel_variant * variant = nullptr;
@@ -389,6 +405,7 @@ struct runtime::impl {
         std::unique_ptr<xrt::bo> trace_bo;
         std::unique_ptr<xrt::bo> mutable_weight_bo;
         std::unique_ptr<xrt::run> run;
+        ggml_backend_buffer_t bound_weight_owner = nullptr;
         void * activation_data = nullptr;
         void * output_data = nullptr;
         void * mutable_weight_data = nullptr;
@@ -448,6 +465,77 @@ struct runtime::impl {
         kernel_status = status.str();
     }
 
+    ~impl() {
+        const std::lock_guard<std::mutex> lock(compute_mutex);
+
+        // A live observer may call back through this impl, so cancel every
+        // remaining subscription before releasing any runtime state.  Child
+        // BOs must be destroyed before the userptr-backed parent BOs.
+        for (const owner_observer & observer : owner_observers) {
+            ggml_backend_buffer_remove_free_observer(observer.handle);
+        }
+        owner_observers.clear();
+        for (const auto & state : states) {
+            state->run.reset();
+            state->bound_weight_owner = nullptr;
+        }
+        weights.clear();
+        roots.clear();
+    }
+
+    static void on_owner_buffer_free(ggml_backend_buffer_t buffer, void * user_data) noexcept {
+        auto * self = static_cast<impl *>(user_data);
+        const std::lock_guard<std::mutex> lock(self->compute_mutex);
+
+        // The core detaches observers before notification, so this callback's
+        // handle is already invalid and must only be forgotten locally.  Drop
+        // command-BO bindings and tensor-specific child views before the
+        // parent userptr registrations while the buffer provider still keeps
+        // the host allocation alive.
+        for (const auto & state : self->states) {
+            if (state->bound_weight_owner == buffer) {
+                state->run.reset();
+                state->bound_weight_owner = nullptr;
+            }
+        }
+        self->weights.erase(
+            std::remove_if(self->weights.begin(), self->weights.end(), [buffer](const auto & weight) {
+                return weight->owner == buffer;
+            }),
+            self->weights.end());
+        self->roots.erase(
+            std::remove_if(self->roots.begin(), self->roots.end(), [buffer](const auto & root) {
+                return root->span.owner == buffer;
+            }),
+            self->roots.end());
+        self->owner_observers.erase(
+            std::remove_if(
+                self->owner_observers.begin(), self->owner_observers.end(),
+                [buffer](const owner_observer & observer) { return observer.owner == buffer; }),
+            self->owner_observers.end());
+    }
+
+    void observe_owner(ggml_backend_buffer_t owner) {
+        const auto existing = std::find_if(
+            owner_observers.begin(), owner_observers.end(),
+            [owner](const owner_observer & observer) { return observer.owner == owner; });
+        if (existing != owner_observers.end()) {
+            return;
+        }
+
+        ggml_backend_buffer_observer_t handle =
+            ggml_backend_buffer_add_free_observer(owner, on_owner_buffer_free, this);
+        if (handle == nullptr) {
+            throw std::runtime_error("failed to observe immutable GGML weight buffer lifetime");
+        }
+        try {
+            owner_observers.push_back({ owner, handle });
+        } catch (...) {
+            ggml_backend_buffer_remove_free_observer(handle);
+            throw;
+        }
+    }
+
     const kernel_state * select_state(const xdna_problem & problem) const noexcept {
         for (const auto & state : states) {
             if (state->variant != nullptr && kernel_variant_supports(*state->variant, problem)) {
@@ -484,12 +572,18 @@ struct runtime::impl {
         const auto start = std::chrono::steady_clock::now();
         auto root = std::make_unique<root_registration>(device, wanted);
         const auto stop = std::chrono::steady_clock::now();
+        roots.emplace_back(std::move(root));
+        try {
+            observe_owner(wanted.owner);
+        } catch (...) {
+            roots.pop_back();
+            throw;
+        }
         buffer_registrations.fetch_add(1);
         registered_bytes.fetch_add(wanted.page_bytes);
         registration_time_ns.fetch_add(elapsed_ns(start, stop));
         explicit_bo_creations.fetch_add(1);
         explicit_bo_creation_bytes.fetch_add(wanted.page_bytes);
-        roots.emplace_back(std::move(root));
         return *roots.back();
     }
 
@@ -584,6 +678,7 @@ struct runtime::impl {
     std::vector<std::unique_ptr<kernel_state>> states;
     std::vector<std::unique_ptr<root_registration>> roots;
     std::vector<std::unique_ptr<weight_view>> weights;
+    std::vector<owner_observer> owner_observers;
     std::mutex compute_mutex;
 
     std::atomic<uint64_t> initialization_time_ns { 0 };
@@ -720,7 +815,11 @@ int runtime::compute(ggml_tensor * op) noexcept {
         pimpl->sync_to_device_time_ns.fetch_add(activation_sync_ns);
         host_memory_fence();
 
+        kernel->ensure_run();
         kernel->run->set_arg(3, weight_bo);
+        kernel->bound_weight_owner =
+            ggml_backend_buffer_get_usage(op->src[0]->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS ?
+                op->src[0]->buffer : nullptr;
         const auto run_start_begin = std::chrono::steady_clock::now();
         kernel->run->start();
         const auto run_start_end = std::chrono::steady_clock::now();
