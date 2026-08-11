@@ -17,6 +17,20 @@ Kernel artifacts are generated, not committed. With an MLIR-AIE IRON
 environment containing Peano:
 
 ```sh
+python3.12 -m venv /path/to/ironenv
+/path/to/ironenv/bin/python -m pip install \
+    "mlir_aie==1.3.4" \
+    -f https://github.com/Xilinx/mlir-aie/releases/expanded_assets/v1.3.4
+/path/to/ironenv/bin/python -m pip install \
+    "llvm-aie==21.0.0.2026062301+cb664e8c" \
+    -f https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly
+```
+
+Those are the independently reproduced versions used for the physical results
+below; Torch or Torch-XDNA is not a build dependency. Then generate the local
+artifacts:
+
+```sh
 source /opt/xilinx/xrt/setup.sh
 make IRON_ENV=/path/to/ironenv
 export GGML_XDNA_AIE2P_Q4_0_GEMV_BUNDLE="$PWD/gemv-q4_0-288.ggmlxdna"
@@ -87,13 +101,18 @@ The E4B gate/up specialization uses the same 32-tile and eight-stream spatial
 mapping for twenty 512-row waves. Each worker holds the single BF16 activation
 object across all waves, while weights and outputs advance in 16-row tiles.
 Depth-one FIFOs preserve the validated forwarding behavior of the pinned
-toolchain. Physical RyzenAI-npu4 measurements with persistent XRT state and
-required per-call activation/output synchronization produced exact CPU-reference
-agreement and approximately 1.05 ms steady-state latency (14.0 GB/s over the
-14,745,600-byte native-Q4_0 matrix). A 15-weight-stream experiment was 0.9-1.3%
-slower and nearly doubled the controller instruction stream, so it is not
-included. This result used MLIR-AIE 1.3.4, Peano
+toolchain. Four consecutive waves share one runtime task group, which
+amortizes controller waits without using depth-two storage. A 10,001-call
+physical stress test matched the CPU reference and measured 778.540 us median
+(18.94 GB/s over the 14,745,600-byte native-Q4_0 matrix), 25.9% lower latency
+than finishing one task group per wave. Eight-wave groups were faster in a
+101-call test but hung during the sustained run and are deliberately rejected;
+twenty waves exhaust shim BD IDs during lowering. A 15-weight-stream experiment
+was also slower and nearly doubled the controller instruction stream, so it is
+not included. This result used MLIR-AIE 1.3.4, Peano
 `cb664e8cc3eb42a12e3ad3cee28729785ffa97a3`, and XRT 2.20.0; generated artifacts
 remain local and must be rebuilt for distribution. The physically validated
 ABI-v1 bundle was 189,971 bytes with SHA-256
-`7aad3b566e3059cffb81b3f19739f7bab830fbf26f73e2ebc017255e4e56be67`.
+`d51bc1954a357b105bb2a6f294b5208b7143767f5318ac0ccb3e660bdd0e5c9e`;
+its 45,620-byte instruction stream has SHA-256
+`72d2c1961c729a4c75733ac081b433f29ec885e8e6bacf720cb89fe489b8e913`.

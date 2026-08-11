@@ -28,6 +28,7 @@ def build_program():
     rows_per_group = rows_per_worker * workers_per_group
     rows_per_wave = rows_per_worker * worker_count
     wave_count = rows // rows_per_wave
+    task_group_waves = 4
     q4_row_bytes = (columns // 32) * 18
 
     assert worker_count == 32
@@ -150,27 +151,30 @@ def build_program():
         )
         runtime.finish_task_group(activation_tasks)
 
-        # A wave task group contains eight independent group fills and drains.
-        # Finishing each group keeps shim-BD use bounded and is conservative
-        # with the depth-one forwarding required by this pinned toolchain.
-        for wave in range(wave_count):
+        # Queue four waves per task group while preserving depth-one FIFOs.
+        # This amortizes controller waits without using the corrupt depth-two
+        # forwarding path. Eight waves passed a short test but hung under a
+        # 10,001-launch stress run; four passed that full stress test.
+        for first_wave in range(0, wave_count, task_group_waves):
             wave_tasks = runtime.task_group()
-            tap_base = wave * group_count
-            for group in range(group_count):
-                runtime.fill(
-                    group_weight_fifos[group].prod(depth=1),
-                    weights,
-                    group_weight_taps[tap_base + group],
-                    task_group=wave_tasks,
-                )
-            for group in range(group_count):
-                runtime.drain(
-                    group_output_fifos[group].cons(depth=1),
-                    output,
-                    group_output_taps[tap_base + group],
-                    task_group=wave_tasks,
-                    wait=True,
-                )
+            last_wave = min(wave_count, first_wave + task_group_waves)
+            for wave in range(first_wave, last_wave):
+                tap_base = wave * group_count
+                for group in range(group_count):
+                    runtime.fill(
+                        group_weight_fifos[group].prod(depth=1),
+                        weights,
+                        group_weight_taps[tap_base + group],
+                        task_group=wave_tasks,
+                    )
+                for group in range(group_count):
+                    runtime.drain(
+                        group_output_fifos[group].cons(depth=1),
+                        output,
+                        group_output_taps[tap_base + group],
+                        task_group=wave_tasks,
+                        wait=True,
+                    )
             runtime.finish_task_group(wave_tasks)
 
     print(Program(NPU2(), runtime).resolve_program())
