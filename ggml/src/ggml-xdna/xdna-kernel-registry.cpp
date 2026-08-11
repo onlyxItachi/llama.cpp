@@ -247,7 +247,6 @@ bool kernel_variant_supports(
            problem.weights_layout == variant.weights_layout &&
            problem.activation_layout == variant.activation_layout &&
            problem.output_layout == variant.output_layout &&
-           problem.weights_usage != weight_usage::mutable_buffer &&
            problem.default_precision && !problem.src0_hadamard;
 }
 

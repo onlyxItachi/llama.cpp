@@ -10,7 +10,6 @@
 #include <xrt/xrt_kernel.h>
 #include <xrt/experimental/xrt_xclbin.h>
 
-#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
@@ -186,11 +185,16 @@ host_buffer_span get_host_buffer_span(const ggml_tensor * tensor) {
         throw std::runtime_error("failed to query the system page size");
     }
     const uintptr_t page_size = static_cast<uintptr_t>(page_size_value);
-    const uintptr_t page_begin = logical_begin / page_size * page_size;
-    if (logical_end > std::numeric_limits<uintptr_t>::max() - (page_size - 1)) {
+    // Register only the pages needed by this tensor.  A GGML model buffer can
+    // also be a device-owned pinned-host allocation used directly by another
+    // accelerator.  Registering that entire allocation with XRT needlessly
+    // long-term-pins and exposes unrelated weights through the XRT BO.
+    const uintptr_t tensor_end = tensor_begin + tensor_bytes;
+    const uintptr_t page_begin = tensor_begin / page_size * page_size;
+    if (tensor_end > std::numeric_limits<uintptr_t>::max() - (page_size - 1)) {
         throw std::runtime_error("page-rounded host buffer range overflows the address space");
     }
-    const uintptr_t page_end = (logical_end + page_size - 1) / page_size * page_size;
+    const uintptr_t page_end = (tensor_end + page_size - 1) / page_size * page_size;
 
     span.page_base = reinterpret_cast<void *>(page_begin);
     span.page_bytes = static_cast<size_t>(page_end - page_begin);
@@ -383,9 +387,11 @@ struct runtime::impl {
         std::unique_ptr<xrt::bo> output_bo;
         std::unique_ptr<xrt::bo> temporary_bo;
         std::unique_ptr<xrt::bo> trace_bo;
+        std::unique_ptr<xrt::bo> mutable_weight_bo;
         std::unique_ptr<xrt::run> run;
         void * activation_data = nullptr;
         void * output_data = nullptr;
+        void * mutable_weight_data = nullptr;
         uint64_t instruction_sync_time_ns = 0;
     };
 
@@ -459,24 +465,22 @@ struct runtime::impl {
         const host_buffer_span wanted = get_host_buffer_span(tensor);
         for (auto & root : roots) {
             const auto & current = root->span;
+            const uintptr_t current_begin = reinterpret_cast<uintptr_t>(current.page_base);
+            const uintptr_t current_end = current_begin + current.page_bytes;
+            const uintptr_t wanted_begin = reinterpret_cast<uintptr_t>(wanted.page_base);
+            const uintptr_t wanted_end = wanted_begin + wanted.page_bytes;
             if (current.owner == wanted.owner && current.logical_base == wanted.logical_base &&
-                    current.logical_bytes == wanted.logical_bytes) {
+                    current.logical_bytes == wanted.logical_bytes &&
+                    current_begin <= wanted_begin && current_end >= wanted_end) {
                 buffer_registration_hits.fetch_add(1);
                 return *root;
             }
         }
 
-        // Destroy child BOs before replacing a registration for the same GGML
-        // buffer owner. Model weight buffers are immutable and expected to
-        // outlive the backend; a future XDNA-owned buft will provide precise
-        // free-time eviction for more general transient allocations.
-        weights.erase(std::remove_if(weights.begin(), weights.end(), [&](const std::unique_ptr<weight_view> & weight) {
-            return weight->owner == wanted.owner;
-        }), weights.end());
-        roots.erase(std::remove_if(roots.begin(), roots.end(), [&](const std::unique_ptr<root_registration> & root) {
-            return root->span.owner == wanted.owner;
-        }), roots.end());
-
+        // Adjacent tensors may produce roots that overlap by one rounded page.
+        // Keep each immutable tensor window independent: child BOs cannot be
+        // rebound to a grown parent, and this overlap is supported by the
+        // physically validated XRT userptr path.
         const auto start = std::chrono::steady_clock::now();
         auto root = std::make_unique<root_registration>(device, wanted);
         const auto stop = std::chrono::steady_clock::now();
@@ -503,10 +507,6 @@ struct runtime::impl {
     }
 
     xrt::bo & register_weight(const ggml_tensor * tensor) {
-        if (ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
-            throw std::runtime_error("XDNA requires an immutable GGML weight buffer");
-        }
-
         for (auto & weight : weights) {
             if (weight->owner == tensor->buffer && weight->data == tensor->data &&
                     weight->bytes == ggml_nbytes(tensor)) {
@@ -516,11 +516,66 @@ struct runtime::impl {
         }
 
         root_registration & root = register_root(tensor);
-        weights.emplace_back(std::make_unique<weight_view>(root, tensor));
+        auto weight = std::make_unique<weight_view>(root, tensor);
+        sync_weight(*weight);
         weight_registrations.fetch_add(1);
         weight_registered_bytes.fetch_add(ggml_nbytes(tensor));
-        sync_weight(*weights.back());
+        weights.emplace_back(std::move(weight));
         return weights.back()->view;
+    }
+
+    xrt::bo & prepare_weight(
+            kernel_state & kernel,
+            const ggml_tensor * tensor,
+            uint64_t * copied_bytes) {
+        if (tensor == nullptr || tensor->buffer == nullptr || tensor->data == nullptr ||
+                !ggml_backend_buffer_is_host(tensor->buffer)) {
+            throw std::runtime_error("XDNA weight tensor has no supported host buffer backing");
+        }
+
+        if (ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            *copied_bytes = 0;
+            return register_weight(tensor);
+        }
+
+        // Capability queries happen before allocation in several GGML tools,
+        // and ordinary compute buffers are mutable.  Keep that supported path
+        // truthful without caching a userptr registration whose lifetime or
+        // contents are unknown: stage into one state-owned BO on every call.
+        // Immutable model weights continue to use register_weight() above and
+        // therefore retain the zero-secondary-copy steady-state path.
+        const size_t bytes = ggml_nbytes(tensor);
+        if (kernel.mutable_weight_bo == nullptr) {
+            auto mutable_weight_bo = std::make_unique<xrt::bo>(
+                device, bytes, xrt::bo::flags::host_only, kernel.kernel->group_id(3));
+            void * mutable_weight_data = mutable_weight_bo->map<void *>();
+            kernel.mutable_weight_data = mutable_weight_data;
+            kernel.mutable_weight_bo = std::move(mutable_weight_bo);
+            explicit_bo_creations.fetch_add(1);
+            explicit_bo_creation_bytes.fetch_add(bytes);
+        }
+
+        const auto copy_start = std::chrono::steady_clock::now();
+        std::memcpy(kernel.mutable_weight_data, tensor->data, bytes);
+        const uint64_t copy_ns = elapsed_ns(copy_start, std::chrono::steady_clock::now());
+        host_copy_calls.fetch_add(1);
+        host_copy_bytes.fetch_add(bytes);
+        host_copy_time_ns.fetch_add(copy_ns);
+        weight_copy_bytes.fetch_add(bytes);
+
+        const auto sync_start = std::chrono::steady_clock::now();
+        kernel.mutable_weight_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE, bytes, 0);
+        host_memory_fence();
+        const uint64_t sync_ns = elapsed_ns(sync_start, std::chrono::steady_clock::now());
+        weight_sync_to_device_calls.fetch_add(1);
+        weight_sync_to_device_bytes.fetch_add(bytes);
+        weight_sync_to_device_time_ns.fetch_add(sync_ns);
+        sync_to_device_calls.fetch_add(1);
+        sync_to_device_bytes.fetch_add(bytes);
+        sync_to_device_time_ns.fetch_add(sync_ns);
+
+        *copied_bytes = bytes;
+        return *kernel.mutable_weight_bo;
     }
 
     device_info info;
@@ -635,7 +690,8 @@ int runtime::compute(ggml_tensor * op) noexcept {
                 variant.device_output_type != data_type::f32) {
             throw std::runtime_error("selected XDNA kernel variant has an unsupported host storage conversion");
         }
-        xrt::bo & weight_bo = pimpl->register_weight(op->src[0]);
+        uint64_t weight_copy_bytes = 0;
+        xrt::bo & weight_bo = pimpl->prepare_weight(*kernel, op->src[0], &weight_copy_bytes);
 
         const auto activation_pack_start = std::chrono::steady_clock::now();
         ggml_fp32_to_bf16_row(
@@ -719,10 +775,10 @@ int runtime::compute(ggml_tensor * op) noexcept {
             GGML_LOG_INFO(
                 "ggml_xdna: executed GGML_OP_MUL_MAT node '%s' on XDNA variant '%s': "
                 "%s[M=%" PRId64 ",K=%" PRId64 "] x %s[K=%" PRId64 ",N=%" PRId64 "], "
-                "kernel %.3f ms, total %.3f ms, weight copies 0 bytes\n",
+                "kernel %.3f ms, total %.3f ms, weight copies %" PRIu64 " bytes\n",
                 op->name, variant.id, data_type_name(variant.weights_type), variant.m, variant.k,
                 data_type_name(variant.activation_type), variant.k, variant.n,
-                kernel_ns / 1.0e6, total_ns / 1.0e6);
+                kernel_ns / 1.0e6, total_ns / 1.0e6, weight_copy_bytes);
         }
         return 0;
     } catch (const std::exception & e) {

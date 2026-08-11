@@ -262,7 +262,36 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const g
 
 static bool ggml_backend_xdna_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     GGML_UNUSED(dev);
-    return buft == ggml_backend_cpu_buffer_type();
+    if (buft == ggml_backend_cpu_buffer_type()) {
+        return true;
+    }
+
+    // Device-owned host buffer types are the existing GGML contract for
+    // writable/pinned system memory.  In particular, this admits ROCm_Host on
+    // an integrated GPU without also admitting CPU_Mapped, whose device is
+    // null and whose underlying mapping may be read-only.
+    ggml_backend_dev_t owner = ggml_backend_buft_get_device(buft);
+    if (owner == nullptr || ggml_backend_dev_host_buffer_type(owner) != buft) {
+        return false;
+    }
+
+    return ggml_backend_buft_is_host(buft);
+}
+
+static bool ggml_backend_xdna_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    // Opt into scheduler preference only for an exact registered kernel.  This
+    // keeps large-batch prefill on HIP while allowing a shared host-backed
+    // batch-one decode weight to select XDNA.
+    if (op == nullptr || op->src[0] == nullptr || op->src[0]->buffer == nullptr ||
+            !ggml_backend_xdna_device_supports_buft(dev, op->src[0]->buffer->buft)) {
+        return false;
+    }
+
+    ggml_xdna::xdna_problem problem;
+    auto * dev_ctx = static_cast<xdna_device_context *>(dev->context);
+    return ggml_xdna::problem_from_ggml(op, dev_ctx->info.arch, &problem) &&
+           problem.weights_usage == ggml_xdna::weight_usage::immutable &&
+           ggml_xdna::select_kernel_configuration(dev_ctx->kernel_configuration, problem) != nullptr;
 }
 
 static const ggml_backend_device_i ggml_backend_xdna_device_i = {
@@ -277,7 +306,7 @@ static const ggml_backend_device_i ggml_backend_xdna_device_i = {
     /* .buffer_from_host_ptr = */ nullptr,
     /* .supports_op          = */ ggml_backend_xdna_device_supports_op,
     /* .supports_buft        = */ ggml_backend_xdna_device_supports_buft,
-    /* .offload_op           = */ nullptr,
+    /* .offload_op           = */ ggml_backend_xdna_device_offload_op,
     /* .event_new            = */ nullptr,
     /* .event_free           = */ nullptr,
     /* .event_synchronize    = */ nullptr,
