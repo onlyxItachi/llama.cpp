@@ -52,7 +52,9 @@ $(BF16_XCLBIN) $(BF16_INSTRUCTIONS) &: $(BF16_PROGRAM) $(BF16_OBJECT) | check-en
 	@test -s "$(BF16_XCLBIN)" && test -s "$(BF16_INSTRUCTIONS)"
 
 $(BF16_BUNDLE): pack-artifact.py $(BF16_XCLBIN) $(BF16_INSTRUCTIONS) | check-environment
-	$(PYTHON) $< --kind bf16 --xclbin $(BF16_XCLBIN) \
+	$(PYTHON) $< --kind-id 1 --m 288 --k 288 \
+		--weight-bytes 165888 --activation-bytes 576 --output-bytes 1152 \
+		--xclbin $(BF16_XCLBIN) \
 		--instructions $(BF16_INSTRUCTIONS) --output $@
 
 $(Q4_OBJECT): gemv-q4_0-288.cpp | check-environment
@@ -71,5 +73,7 @@ $(Q4_XCLBIN) $(Q4_INSTRUCTIONS) &: $(Q4_PROGRAM) $(Q4_OBJECT) | check-environmen
 	@test -s "$(Q4_XCLBIN)" && test -s "$(Q4_INSTRUCTIONS)"
 
 $(Q4_BUNDLE): pack-artifact.py $(Q4_XCLBIN) $(Q4_INSTRUCTIONS) | check-environment
-	$(PYTHON) $< --kind q4_0 --xclbin $(Q4_XCLBIN) \
+	$(PYTHON) $< --kind-id 2 --m 288 --k 288 \
+		--weight-bytes 46656 --activation-bytes 576 --output-bytes 1152 \
+		--xclbin $(Q4_XCLBIN) \
 		--instructions $(Q4_INSTRUCTIONS) --output $@

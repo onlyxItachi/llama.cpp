@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 
-"""Couple one fixed ggml-xdna kernel ABI, xclbin, and instruction stream."""
+"""Couple one ggml-xdna kernel descriptor, xclbin, and instruction stream."""
 
 import argparse
 import hashlib
@@ -14,15 +14,16 @@ import tempfile
 MAGIC = b"GGXDNA1\0"
 HEADER_BYTES = 64
 ABI_VERSION = 1
-KINDS = {
-    "bf16": (1, 288 * 288 * 2),
-    "q4_0": (2, 288 * (288 // 32) * 18),
-}
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--kind", choices=KINDS, required=True)
+    parser.add_argument("--kind-id", type=int, required=True)
+    parser.add_argument("--m", type=int, required=True)
+    parser.add_argument("--k", type=int, required=True)
+    parser.add_argument("--weight-bytes", type=int, required=True)
+    parser.add_argument("--activation-bytes", type=int, required=True)
+    parser.add_argument("--output-bytes", type=int, required=True)
     parser.add_argument("--xclbin", type=Path, required=True)
     parser.add_argument("--instructions", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -35,18 +36,29 @@ def main():
     if not instructions or len(instructions) % 4:
         raise ValueError("instruction stream must be nonempty 32-bit words")
 
-    kind, weight_bytes = KINDS[args.kind]
+    positive_metadata = {
+        "kind id": args.kind_id,
+        "M": args.m,
+        "K": args.k,
+        "weight bytes": args.weight_bytes,
+        "activation bytes": args.activation_bytes,
+        "output bytes": args.output_bytes,
+    }
+    for name, value in positive_metadata.items():
+        if value <= 0 or value > 0xFFFFFFFF:
+            raise ValueError(f"{name} must fit a nonzero ABI-v1 uint32")
+
     header = struct.pack(
         "<8s8I3Q",
         MAGIC,
         HEADER_BYTES,
         ABI_VERSION,
-        kind,
-        288,
-        288,
-        weight_bytes,
-        288 * 2,
-        288 * 4,
+        args.kind_id,
+        args.m,
+        args.k,
+        args.weight_bytes,
+        args.activation_bytes,
+        args.output_bytes,
         len(xclbin),
         len(instructions),
         0,
