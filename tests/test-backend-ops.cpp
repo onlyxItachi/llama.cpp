@@ -9717,6 +9717,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Fixed batch-1 shapes used by the initial ggml-xdna hardware kernels.
     test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_Q4_0, GGML_TYPE_F32, 288, 1, 288, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_BF16, GGML_TYPE_F32, 288, 1, 288, {1, 1}, {1, 1}));
+    // Llama 3.2 1B gate/up projection shape used by ggml-xdna.
+    test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_BF16, GGML_TYPE_F32, 8192, 1, 2048, {1, 1}, {1, 1}));
     // Gemma 4 E4B sliding-window K/V projection shape used by ggml-xdna.
     test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_Q4_0, GGML_TYPE_F32, 512, 1, 2560, {1, 1}, {1, 1}));
     // Gemma 4 E4B gate/up projection shape used by ggml-xdna.
@@ -10937,6 +10939,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 1, 16416, {8,  1}, {4, 1}, {0, 1, 2, 3}, 2*16416));
     test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_Q4_0, GGML_TYPE_F32, 288, 1, 288, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_BF16, GGML_TYPE_F32, 288, 1, 288, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_BF16, GGML_TYPE_F32, 8192, 1, 2048, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_Q4_0, GGML_TYPE_F32, 512, 1, 2560, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_Q4_0, GGML_TYPE_F32, 10240, 1, 2560, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_weight_q8_0_deterministic(GGML_TYPE_Q8_0, GGML_TYPE_F32, 9216, 1, 2560, {1, 1}, {1, 1}));

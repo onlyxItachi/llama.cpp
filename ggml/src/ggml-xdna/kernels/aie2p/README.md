@@ -6,14 +6,16 @@ from Xilinx/mlir-aie. The meaningful path directly consumes native GGML
 `Q4_0[288,288] x F32[288,1]`; the BF16 version is retained as a simpler plumbing
 reference. Production-shape specializations cover the Gemma 4 E4B
 sliding-window K/V projection `Q4_0[2560,512] x F32[2560,1]` and its gate/up
-projection `Q4_0[2560,10240] x F32[2560,1]`. The host converts only the small
-activation to BF16, while weights remain in their registered GGML host
-allocation. A native `Q8_0[2560,9216] x F32[2560,1]` specialization covers the
-Qwen 3.5 4B gate/up shape. The Q4_0 compute kernel uses AIE2P packed-nibble
-vector unpack, int8-to-BF16 conversion, vector multiply and vector reduction;
-the Q8_0 kernel consumes the native signed-byte lanes directly. The optimized
-Q4_0 artifact distributes the nine 32-row groups over nine workers, while the
-BF16 reference remains single-worker.
+projection `Q4_0[2560,10240] x F32[2560,1]`, plus the Llama 3.2 1B gate/up
+projection `BF16[2048,8192] x F32[2048,1]`. A native
+`Q8_0[2560,9216] x F32[2560,1]` specialization covers the Qwen 3.5 4B gate/up
+shape. The host converts only the small activation to BF16, while weights
+remain in their registered GGML host allocation. The Q4_0 compute kernel uses
+AIE2P packed-nibble vector unpack, int8-to-BF16 conversion, vector multiply and
+vector reduction; the Q8_0 kernel consumes the native signed-byte lanes
+directly. The optimized Q4_0 artifact distributes the nine 32-row groups over
+nine workers. The 288x288 BF16 reference remains single-worker; the production
+BF16 specialization uses all 32 compute tiles.
 
 Kernel artifacts are generated, not committed. With an MLIR-AIE IRON
 environment containing Peano:
@@ -45,6 +47,7 @@ bundles:
 export GGML_XDNA_AIE2P_Q4_0_GEMV_M512_K2560_BUNDLE="$PWD/gemv-q4_0-m512-k2560.ggmlxdna"
 export GGML_XDNA_AIE2P_Q4_0_GEMV_M10240_K2560_BUNDLE="$PWD/gemv-q4_0-m10240-k2560.ggmlxdna"
 export GGML_XDNA_AIE2P_Q8_0_GEMV_M9216_K2560_BUNDLE="$PWD/gemv-q8_0-m9216-k2560.ggmlxdna"
+export GGML_XDNA_AIE2P_BF16_GEMV_M8192_K2048_BUNDLE="$PWD/gemv-bf16-m8192-k2048.ggmlxdna"
 ```
 
 The runtime discovers every configured registered bundle, creates one
@@ -209,3 +212,47 @@ is 187,411 bytes, and has SHA-256
 `3d911dfbf792c9e1eae13c73bf15abe41533f5793df995931302424c67483605`.
 The corresponding current M=512 bundle has SHA-256
 `040d2d30463f990be44aa40449cc1066628476f3451e2fb966b502c144cedf3e`.
+
+The BF16 M=8192, K=2048 specialization comes from
+`unsloth/Llama-3.2-1B-Instruct-GGUF`, file
+`Llama-3.2-1B-Instruct-BF16.gguf`, revision
+`b69aef112e9f895e6f98d7ae0949f72ff09aa401`. That 2,479,595,264-byte GGUF has
+SHA-256
+`f5d05e90d179fa27c01a049be1574a0201bdc09ba0b345eb85e1dbf3b87610f3`.
+Its gate/up tensors establish the stored `[2048,8192]` shape.
+
+The kernel maps eight rows to each of 32 workers and covers 256 rows per wave
+for 32 waves. A native row is 4,096 bytes. Sixteen rows would require 16,384
+32-bit core-DMA granules, one more than the 16,383-granule limit, so the
+eight-row object is an ABI/topology requirement rather than an arbitrary tile
+choice. The placed design uses 41,004 of 65,536 local bytes per core and
+131,200 of 524,288 bytes per memtile group. One activation acquisition is
+retained across all waves and four waves share each depth-one task group.
+
+Seven physical directed patterns, including first/last-column impulses and
+finite BF16 normal/subnormal extremes, matched a long-double CPU reference
+exactly. A 10,001-launch persistent run measured 721.268 us p50, 767.737 us
+p95, and 46.521 GB/s over the 33,554,432-byte native matrix. Including the
+F32-to-BF16 activation conversion and activation/output synchronization
+measured 722.667 us p50. The generated ABI-v1 bundle is 188,051 bytes and has
+SHA-256
+`6f9132673cf1f6fc90445766dcadb07edddffa6d62f9b3a6e1574dc62fb62d1f`;
+its instruction stream
+has SHA-256
+`91d5b29a0b6ff922d2a7ef1ae2ab1eee2316eaeccf82b402f71721771f3adcfc`.
+Those are the physically validated artifact hashes. A fresh Makefile rebuild
+reproduced the MLIR, compute object, addressed MLIR, PDI, and instruction
+stream byte-for-byte; `xclbinutil` assigned a new xclbin UUID, so the rebuilt
+xclbin and enclosing bundle have different container hashes.
+
+The ordinary GGML backend test also loaded the physically validated bundle
+alongside the other five registered artifacts and passed all six CPU-reference
+cases with zero weight-copy bytes. That coexistence log has SHA-256
+`3558dd263fb259326b14e41f00669ebe6b85ba5798195a8d64c75a6fcf547f27`.
+
+The fair single-call gfx1151 control was faster. Across a clean D-H-H-D order,
+the mean of two trial medians was 388.104 us for a device-resident BF16 weight
+and 391.938 us for the same persistent weight in `ROCm_Host`. XDNA was 1.858x
+and 1.840x slower respectively. The registry therefore exposes this
+specialization for explicit coverage and XDNA-only use but keeps
+`prefer_for_offload=false`.

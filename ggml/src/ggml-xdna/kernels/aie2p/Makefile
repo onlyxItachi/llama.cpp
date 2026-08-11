@@ -15,6 +15,11 @@ BF16_OBJECT := gemv-bf16-288.o
 BF16_XCLBIN := gemv-bf16-288.xclbin
 BF16_INSTRUCTIONS := gemv-bf16-288.insts.bin
 BF16_BUNDLE := gemv-bf16-288.ggmlxdna
+BF16_M8192_K2048_PROGRAM := gemv-bf16-m8192-k2048.mlir
+BF16_M8192_K2048_OBJECT := gemv-bf16-m8192-k2048.o
+BF16_M8192_K2048_XCLBIN := gemv-bf16-m8192-k2048.xclbin
+BF16_M8192_K2048_INSTRUCTIONS := gemv-bf16-m8192-k2048.insts.bin
+BF16_M8192_K2048_BUNDLE := gemv-bf16-m8192-k2048.ggmlxdna
 Q4_PROGRAM := gemv-q4_0-288.mlir
 Q4_OBJECT := gemv-q4_0-288.o
 Q4_XCLBIN := gemv-q4_0-288.xclbin
@@ -39,15 +44,16 @@ Q8_M9216_K2560_BUNDLE := gemv-q8_0-m9216-k2560.ggmlxdna
 .PHONY: all check-environment clean
 .DELETE_ON_ERROR:
 
-all: $(Q4_BUNDLE) $(Q4_E4B_KV_BUNDLE) $(Q4_M10240_K2560_BUNDLE) $(Q8_M9216_K2560_BUNDLE) $(BF16_BUNDLE)
+all: $(Q4_BUNDLE) $(Q4_E4B_KV_BUNDLE) $(Q4_M10240_K2560_BUNDLE) $(Q8_M9216_K2560_BUNDLE) $(BF16_BUNDLE) $(BF16_M8192_K2048_BUNDLE)
 
 clean:
 	$(RM) $(BF16_PROGRAM) $(BF16_OBJECT) $(BF16_XCLBIN) $(BF16_INSTRUCTIONS) $(BF16_BUNDLE)
+	$(RM) $(BF16_M8192_K2048_PROGRAM) $(BF16_M8192_K2048_OBJECT) $(BF16_M8192_K2048_XCLBIN) $(BF16_M8192_K2048_INSTRUCTIONS) $(BF16_M8192_K2048_BUNDLE)
 	$(RM) $(Q4_PROGRAM) $(Q4_OBJECT) $(Q4_XCLBIN) $(Q4_INSTRUCTIONS) $(Q4_BUNDLE)
 	$(RM) $(Q4_E4B_KV_PROGRAM) $(Q4_E4B_KV_OBJECT) $(Q4_E4B_KV_XCLBIN) $(Q4_E4B_KV_INSTRUCTIONS) $(Q4_E4B_KV_BUNDLE)
 	$(RM) $(Q4_M10240_K2560_PROGRAM) $(Q4_M10240_K2560_OBJECT) $(Q4_M10240_K2560_XCLBIN) $(Q4_M10240_K2560_INSTRUCTIONS) $(Q4_M10240_K2560_BUNDLE)
 	$(RM) $(Q8_M9216_K2560_PROGRAM) $(Q8_M9216_K2560_OBJECT) $(Q8_M9216_K2560_XCLBIN) $(Q8_M9216_K2560_INSTRUCTIONS) $(Q8_M9216_K2560_BUNDLE)
-	$(RM) -r gemv-bf16-288.mlir.prj gemv-q4_0-288.mlir.prj gemv-q4_0-m512-k2560.mlir.prj gemv-q4_0-m10240-k2560.mlir.prj gemv-q8_0-m9216-k2560.mlir.prj
+	$(RM) -r gemv-bf16-288.mlir.prj gemv-bf16-m8192-k2048.mlir.prj gemv-q4_0-288.mlir.prj gemv-q4_0-m512-k2560.mlir.prj gemv-q4_0-m10240-k2560.mlir.prj gemv-q8_0-m9216-k2560.mlir.prj
 
 check-environment:
 	@test -x "$(PYTHON)" || { echo "set IRON_ENV to an MLIR-AIE IRON environment" >&2; exit 1; }
@@ -74,6 +80,27 @@ $(BF16_BUNDLE): pack-artifact.py $(BF16_XCLBIN) $(BF16_INSTRUCTIONS) | check-env
 		--weight-bytes 165888 --activation-bytes 576 --output-bytes 1152 \
 		--xclbin $(BF16_XCLBIN) \
 		--instructions $(BF16_INSTRUCTIONS) --output $@
+
+$(BF16_M8192_K2048_OBJECT): gemv-bf16-m8192-k2048.cpp | check-environment
+	$(PEANO_CLANGXX) -O2 -std=c++20 --target=aie2p-none-unknown-elf -DNDEBUG \
+		-D__AIE_API_AIE_ADF_HPP__ -I"$(AIE_API_INCLUDE)" -c $< -o $@
+
+$(BF16_M8192_K2048_PROGRAM): gemv-bf16-m8192-k2048.py | check-environment
+	$(PYTHON) $< > $@
+
+$(BF16_M8192_K2048_XCLBIN) $(BF16_M8192_K2048_INSTRUCTIONS) &: $(BF16_M8192_K2048_PROGRAM) $(BF16_M8192_K2048_OBJECT) | check-environment
+	PATH="$(MLIR_AIE)/bin:$$PATH" $(AIECC) \
+		--alloc-scheme=basic-sequential \
+		--aie-generate-xclbin --no-compile-host --xclbin-name=$(BF16_M8192_K2048_XCLBIN) \
+		--no-xchesscc --no-xbridge --peano "$(PEANO)" \
+		--aie-generate-npu-insts --npu-insts-name=$(BF16_M8192_K2048_INSTRUCTIONS) $<
+	@test -s "$(BF16_M8192_K2048_XCLBIN)" && test -s "$(BF16_M8192_K2048_INSTRUCTIONS)"
+
+$(BF16_M8192_K2048_BUNDLE): pack-artifact.py $(BF16_M8192_K2048_XCLBIN) $(BF16_M8192_K2048_INSTRUCTIONS) | check-environment
+	$(PYTHON) $< --kind-id 1 --m 8192 --k 2048 \
+		--weight-bytes 33554432 --activation-bytes 4096 --output-bytes 32768 \
+		--xclbin $(BF16_M8192_K2048_XCLBIN) \
+		--instructions $(BF16_M8192_K2048_INSTRUCTIONS) --output $@
 
 $(Q4_OBJECT): gemv-q4_0-288.cpp | check-environment
 	$(PEANO_CLANGXX) -O2 -std=c++20 --target=aie2p-none-unknown-elf -DNDEBUG \
