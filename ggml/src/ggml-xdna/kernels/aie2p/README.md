@@ -7,8 +7,8 @@ from Xilinx/mlir-aie. The meaningful path directly consumes native GGML
 reference. The host converts only the small activation to BF16, while weights
 remain in their registered GGML host allocation. The Q4_0 compute kernel uses
 AIE2P packed-nibble vector unpack, int8-to-BF16 conversion, vector multiply and
-vector reduction. Its IRON design remains a single-worker performance step;
-multi-tile row distribution is the next specialization.
+vector reduction. The optimized Q4_0 artifact distributes the nine 32-row
+groups over nine workers, while the BF16 reference remains single-worker.
 
 Kernel artifacts are generated, not committed. With an MLIR-AIE IRON
 environment containing Peano:
@@ -50,5 +50,13 @@ conversion, multiply/MAC and reduction without scalar soft-float helpers.
 Three row accumulators reuse each activation vector load; four rows were slower
 because the pinned compiler spills vector state. The last packed block in each
 FIFO object is staged through an aligned local buffer because the fast
-unaligned vector primitive may issue wider surrounding loads. The remaining
-performance step is to distribute output rows over multiple workers.
+unaligned vector primitive may issue wider surrounding loads.
+
+The IRON design places eight workers across compute row 2 and the ninth at
+column 0, row 3. One direct shim stream broadcasts the BF16 activation once.
+Weights remain in native row order and are split as 4 + 4 + 1 worker groups;
+outputs use matching memory-tile joins. This grouping respects the pinned
+toolchain's five-input/five-output memory-tile DMA-channel limit. Every FIFO
+remains depth one, so the known depth-two forwarding corruption is not
+reintroduced. Further work should measure dispatch and DMA bounds and add a
+separate, validated pipelined artifact rather than mutating this topology.

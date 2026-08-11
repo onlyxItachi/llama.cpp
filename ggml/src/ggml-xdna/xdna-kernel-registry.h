@@ -90,8 +90,8 @@ struct xdna_kernel_variant {
     size_t weight_bytes;
     size_t device_activation_bytes;
     size_t device_output_bytes;
-    uint32_t tile_rows;
-    uint32_t tile_columns;
+    uint32_t rows_per_worker;
+    uint32_t worker_count;
 };
 
 const char * architecture_name(device_architecture architecture) noexcept;

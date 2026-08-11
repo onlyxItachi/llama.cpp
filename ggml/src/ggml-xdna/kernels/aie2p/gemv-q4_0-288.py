@@ -10,17 +10,17 @@ from ml_dtypes import bfloat16
 
 from aie.helpers.taplib import TensorAccessPattern, TensorTiler2D
 from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
-from aie.iron.device import NPU2
+from aie.iron.device import NPU2, Tile
 
 
 def build_program():
     rows = 288
     columns = 288
-    rows_per_tile = 32
+    worker_count = 9
+    rows_per_worker = rows // worker_count
     columns_per_block = 32
     bytes_per_block = 18
 
-    row_tiles = rows // rows_per_tile
     column_blocks = columns // columns_per_block
     q4_row_bytes = column_blocks * bytes_per_block
 
@@ -31,9 +31,18 @@ def build_program():
     weights_type = np.ndarray[(rows, q4_row_bytes), q4_type]
     activation_type = np.ndarray[(1, columns), bf16_type]
     output_type = np.ndarray[(1, rows), f32_type]
-    weight_tile_type = np.ndarray[(rows_per_tile, q4_row_bytes), q4_type]
+    weight_tile_type = np.ndarray[(rows_per_worker, q4_row_bytes), q4_type]
     activation_tile_type = np.ndarray[(columns,), bf16_type]
-    output_tile_type = np.ndarray[(rows_per_tile,), f32_type]
+    output_tile_type = np.ndarray[(rows_per_worker,), f32_type]
+    workers_per_group = [4, 4, 1]
+    group_row_counts = [count * rows_per_worker for count in workers_per_group]
+    group_weight_types = [
+        np.ndarray[(row_count, q4_row_bytes), q4_type]
+        for row_count in group_row_counts
+    ]
+    group_output_types = [
+        np.ndarray[(row_count,), f32_type] for row_count in group_row_counts
+    ]
 
     gemv = Kernel(
         "gemv_q4_0_bf16_f32",
@@ -50,33 +59,96 @@ def build_program():
         activation_fifo.release(1)
         output_fifo.release(1)
 
-    # Depth one is required by the pinned 1.3.4 toolchain. A depth-two
-    # forwarding FIFO corrupted the first scale of row 96 on even launches.
-    memory_weight_fifo = ObjectFifo(weight_tile_type, depth=1, name="weights_q4_0")
-    compute_weight_fifo = memory_weight_fifo.cons().forward(depth=1)
-    activation_fifo = ObjectFifo(activation_tile_type, depth=1, name="activation_bf16")
-    output_fifo = ObjectFifo(output_tile_type, depth=1, name="output_f32")
-    worker = Worker(
-        core_fn,
-        [compute_weight_fifo.cons(), activation_fifo.cons(), output_fifo.prod(), gemv],
-        # Vector state and exact fp16-scale conversion need more than IRON's
-        # default 1 KiB stack.
-        stack_size=0x1000,
+    # Depth one remains required by the pinned 1.3.4 toolchain. One shim stream
+    # broadcasts the activation directly to all nine compute tiles.
+    activation_fifo = ObjectFifo(
+        activation_tile_type, depth=1, name="activation_bf16_broadcast"
     )
+    # Three host transfers cover 4 + 4 + 1 worker slices. The two four-way
+    # memory-tile splits stay within the five-output-channel tile limit, while
+    # retaining native contiguous GGML rows and depth-one worker FIFOs.
+    group_weight_fifos = [
+        ObjectFifo(group_weight_types[group], depth=1, name=f"weights_group_{group}")
+        for group in range(3)
+    ]
+    worker_weight_fifos = []
+    group_start_worker = 0
+    for group, group_workers in enumerate(workers_per_group):
+        worker_weight_fifos.extend(
+            group_weight_fifos[group].cons().split(
+                [i * rows_per_worker * q4_row_bytes for i in range(group_workers)],
+                tile=Tile(0 if group in (0, 2) else 4, 1),
+                depths=[1] * group_workers,
+                obj_types=[weight_tile_type] * group_workers,
+                names=[
+                    f"weights_rows_{i * rows_per_worker}_{(i + 1) * rows_per_worker - 1}"
+                    for i in range(group_start_worker, group_start_worker + group_workers)
+                ],
+            )
+        )
+        group_start_worker += group_workers
 
-    # One native GGML row is 162 bytes, while contiguous AIE2P DMA lengths must
-    # be divisible by four. Pairing rows gives exact 324-byte transfers: no
-    # padding, over-read, reorder, or dequantized matrix is introduced.
-    weight_tap = TensorAccessPattern(
-        (rows, q4_row_bytes),
-        offset=0,
-        sizes=[row_tiles, rows_per_tile // 2, 2 * q4_row_bytes],
-        strides=[rows_per_tile * q4_row_bytes, 2 * q4_row_bytes, 1],
-    )
-    activation_tap = TensorTiler2D.simple_tiler(
-        (1, columns), pattern_repeat=row_tiles, prune_step=False
-    )[0]
-    output_tap = TensorTiler2D.simple_tiler((1, rows), (1, rows), prune_step=False)[0]
+    # Two four-way joins and one one-way join collect the same row groups. This
+    # avoids the eight-input join rejected by the pinned memory-tile allocator.
+    group_output_fifos = [
+        ObjectFifo(group_output_types[group], depth=1, name=f"output_group_{group}")
+        for group in range(3)
+    ]
+    worker_output_fifos = []
+    group_start_worker = 0
+    for group, group_workers in enumerate(workers_per_group):
+        worker_output_fifos.extend(
+            group_output_fifos[group].prod(depth=1).join(
+                [i * rows_per_worker for i in range(group_workers)],
+                tile=Tile((2, 6, 7)[group], 1),
+                depths=[1] * group_workers,
+                obj_types=[output_tile_type] * group_workers,
+                names=[
+                    f"output_rows_{i * rows_per_worker}_{(i + 1) * rows_per_worker - 1}"
+                    for i in range(group_start_worker, group_start_worker + group_workers)
+                ],
+            )
+        )
+        group_start_worker += group_workers
+
+    worker_tiles = [Tile(column, 2) for column in range(8)] + [Tile(0, 3)]
+    workers = [
+        Worker(
+            core_fn,
+            [
+                worker_weight_fifos[i].cons(depth=1),
+                activation_fifo.cons(depth=1),
+                worker_output_fifos[i].prod(depth=1),
+                gemv,
+            ],
+            tile=worker_tiles[i],
+            stack_size=0x1000,
+        )
+        for i in range(worker_count)
+    ]
+
+    group_weight_taps = []
+    group_output_taps = []
+    row_offset = 0
+    for row_count in group_row_counts:
+        group_weight_taps.append(
+            TensorAccessPattern(
+                (rows, q4_row_bytes),
+                offset=row_offset * q4_row_bytes,
+                sizes=[1, 1, row_count, q4_row_bytes],
+                strides=[0, 0, q4_row_bytes, 1],
+            )
+        )
+        group_output_taps.append(
+            TensorAccessPattern(
+                (1, rows),
+                offset=row_offset,
+                sizes=[1, 1, 1, row_count],
+                strides=[0, 0, 0, 1],
+            )
+        )
+        row_offset += row_count
+    activation_tap = TensorTiler2D.simple_tiler((1, columns), prune_step=False)[0]
 
     runtime = Runtime()
     with runtime.sequence(weights_type, activation_type, output_type) as (
@@ -84,10 +156,21 @@ def build_program():
         activation,
         output,
     ):
-        runtime.start(worker)
-        runtime.fill(activation_fifo.prod(), activation, activation_tap)
-        runtime.fill(memory_weight_fifo.prod(), weights, weight_tap)
-        runtime.drain(output_fifo.cons(), output, output_tap, wait=True)
+        runtime.start(*workers)
+        runtime.fill(activation_fifo.prod(depth=1), activation, activation_tap)
+        for group in range(3):
+            runtime.fill(
+                group_weight_fifos[group].prod(depth=1),
+                weights,
+                group_weight_taps[group],
+            )
+        for group in range(3):
+            runtime.drain(
+                group_output_fifos[group].cons(depth=1),
+                output,
+                group_output_taps[group],
+                wait=True,
+            )
 
     print(Program(NPU2(), runtime).resolve_program())
 

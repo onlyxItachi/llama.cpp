@@ -41,8 +41,8 @@ constexpr xdna_kernel_variant variants[] = {
         /* .weight_bytes            = */ 288 * (288 / ggml_q4_0_block_values) * ggml_q4_0_block_bytes,
         /* .device_activation_bytes = */ 288 * sizeof(uint16_t),
         /* .device_output_bytes     = */ 288 * sizeof(float),
-        /* .tile_rows               = */ 32,
-        /* .tile_columns            = */ 288,
+        /* .rows_per_worker         = */ 32,
+        /* .worker_count            = */ 9,
     },
     {
         /* .id                      = */ "aie2p-bf16-gemv-m288-n1-k288",
@@ -71,8 +71,8 @@ constexpr xdna_kernel_variant variants[] = {
         /* .weight_bytes            = */ 288 * 288 * sizeof(uint16_t),
         /* .device_activation_bytes = */ 288 * sizeof(uint16_t),
         /* .device_output_bytes     = */ 288 * sizeof(float),
-        /* .tile_rows               = */ 32,
-        /* .tile_columns            = */ 32,
+        /* .rows_per_worker         = */ 32,
+        /* .worker_count            = */ 1,
     },
 };
 

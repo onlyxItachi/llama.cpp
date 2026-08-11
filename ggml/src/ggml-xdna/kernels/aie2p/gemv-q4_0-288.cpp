@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: MIT
 
-// Single-worker vector kernel for native GGML block_q4_0 bytes. Multi-tile row
-// distribution is deliberately kept in the IRON design rather than this
-// shape-specific compute primitive.
+// Per-worker vector kernel for native GGML block_q4_0 bytes. The IRON design
+// instantiates this 32-row primitive across the selected worker topology.
 
 #include <aie_api/aie.hpp>
 #include <stdint.h>
