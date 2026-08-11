@@ -6,24 +6,25 @@ XDNA decode.
 
 ## Revisions and repository state
 
-XDNA work began from clean upstream llama.cpp commit
+The initial XDNA bring-up began from clean upstream llama.cpp commit
 [`6e62ba538478202094edc6c100c782719e310aa3`](https://github.com/ggml-org/llama.cpp/commit/6e62ba538478202094edc6c100c782719e310aa3)
 on branch `feat/ggml-xdna`. The fork is `onlyxItachi/llama.cpp` (`origin`) and
 `ggml-org/llama.cpp` is `upstream`. No user work was reset.
 
-A final non-destructive fetch found that upstream had advanced to
-[`2468576f241235452013308597e6de1b78866996`](https://github.com/ggml-org/llama.cpp/commit/2468576f241235452013308597e6de1b78866996)
-while the hardware work was running. Its three intervening commits do not
-change any GGML/backend/model/scheduler file inspected for this design, so the
-validated branch remains on the exact recorded start SHA rather than rewriting
-tested history at the end of the experiment.
+Before the vector-performance sprint, the XDNA head was
+`31ab68b083e1b6baa00bb36bdf0c48766235f255`. It was backed up at
+`backup/ggml-xdna-pre-vector-20260811`, then rebased non-destructively onto
+current upstream [`70dfba5aee36793fb51ae649723b3c30ed9e99d3`](https://github.com/ggml-org/llama.cpp/commit/70dfba5aee36793fb51ae649723b3c30ed9e99d3).
+The patch-equivalent post-rebase XDNA baseline was
+`9b625b68fedad18249e9f970919d18421e426796`. The optimization commits remain
+separate local milestones on `feat/ggml-xdna`; none was pushed by this sprint.
 
 The current default-branch heads inspected with Git and GitHub CLI were:
 
 | Project | Exact revision |
 | --- | --- |
 | Xilinx/mlir-aie | [`a8fea363dfd63015cffd380e0679950419a0a7cd`](https://github.com/Xilinx/mlir-aie/commit/a8fea363dfd63015cffd380e0679950419a0a7cd) |
-| mlir-aie Peano/llvm-aie pin | [`c9c5ecb725fc8c765e4b687356e6ec1e54da7a0e`](https://github.com/Xilinx/llvm-aie/commit/c9c5ecb725fc8c765e4b687356e6ec1e54da7a0e), wheel `21.0.0.2026080301+c9c5ecb7` |
+| Installed mlir-aie / Peano | mlir-aie `1.3.4` (release source [`ed23bba7381b6f0680775fd3b6110d9268d27f43`](https://github.com/Xilinx/mlir-aie/commit/ed23bba7381b6f0680775fd3b6110d9268d27f43)); llvm-aie [`cb664e8cc3eb42a12e3ad3cee28729785ffa97a3`](https://github.com/Xilinx/llvm-aie/commit/cb664e8cc3eb42a12e3ad3cee28729785ffa97a3), wheel `21.0.0.2026062301+cb664e8c` |
 | amd/xdna-driver | [`d73478232a7057bfea73a24f74b09df4e5580ad8`](https://github.com/amd/xdna-driver/commit/d73478232a7057bfea73a24f74b09df4e5580ad8) |
 | Xilinx/XRT | [`27bed122dd01ca3e21dbf2b07000078ec842c98c`](https://github.com/Xilinx/XRT/commit/27bed122dd01ca3e21dbf2b07000078ec842c98c); driver pin [`8b60ae7a90bfbc873e181497fd34ca520b4ef504`](https://github.com/Xilinx/XRT/commit/8b60ae7a90bfbc873e181497fd34ca520b4ef504) |
 | amd/Triton-XDNA | [`434dc3ec3de0fa0de2d2e26236e363967a00e265`](https://github.com/amd/Triton-XDNA/commit/434dc3ec3de0fa0de2d2e26236e363967a00e265) |
@@ -32,10 +33,12 @@ The current default-branch heads inspected with Git and GitHub CLI were:
 | RyzenAI-SW historical llama branch | [`d78a8cf57cfbda319ec09dcac941ddfc34f5793f`](https://github.com/amd/RyzenAI-SW/commit/d78a8cf57cfbda319ec09dcac941ddfc34f5793f) |
 
 The live machine has XRT 2.20.0 (`021204355eeaa034ff69aae407ace2265adf047a`),
-firmware 1.1.2.64, and an accessible `RyzenAI-npu4` at `0000:67:00.1` through
-`/dev/accel/accel0`. `xrt-smi validate` passed its supplied INT8 GEMM test at
-51.0 TOPS and its submission-latency test at about 46 us. Those are stack-health
-results, not GGML performance.
+amdxdna 0.7.0 (`srcversion 3873C4BB9348F32F5C9E515`), firmware 1.1.2.64,
+and an accessible `RyzenAI-npu4` at `0000:67:00.1` through
+`/dev/accel/accel0`. The device exposes eight columns and uses KMQ.
+`xrt-smi validate` passed its supplied INT8 GEMM test at 51.0 TOPS and its
+submission-latency test at about 46 us. Those are stack-health results, not
+GGML performance.
 
 ## Current GGML integration surface
 
@@ -214,8 +217,28 @@ package reconstructs the `XRT::xrt_coreutil` dependency; a fresh external
 consumer configured against the install, linked XRT, initialized `XDNA0`, and
 loaded the Q4 bundle successfully.
 
-The backend selects one explicitly configured kernel bundle and accepts only
-its exact contract:
+The host no longer treats 288 as a backend property. `problem_from_ggml()`
+translates an operation and its tensor metadata into an `xdna_problem`:
+
+```text
+GGML_OP_MUL_MAT + tensor metadata
+  -> operation and host/device dtypes
+  -> M/N/K, batch dimensions, layouts, weight lifetime, device architecture
+  -> registry capability match
+  -> specialized xdna_kernel_variant
+```
+
+Each registry entry owns its shape, architecture, artifact ABI, XRT symbol,
+opcode, byte sizes, and worker geometry. The AIE2P Q4_0 288x1x288 and BF16
+reference kernels are two entries, not switch cases scattered across the
+backend/runtime. The artifact packer likewise receives metadata from the
+shape-specific build instead of maintaining a second dtype/288 table. This is
+deliberately a specialization registry, not a universally dynamic kernel.
+The current runtime still loads one explicitly configured bundle per backend
+instance; simultaneous multi-bundle residency/selection is the next host-side
+extension when a second useful shape exists.
+
+The configured variant accepts only its exact contract:
 
 - `GGML_OP_MUL_MAT`;
 - contiguous native `Q4_0[288,288] x F32[288,1] -> F32[288,1]`, or the retained
@@ -233,26 +256,29 @@ arbitrary xclbin.
 
 Every prefill/batched shape and every other dtype is rejected. The Q4_0 kernel
 reads the native 18-byte `block_q4_0` representation and decodes scale/nibbles
-on-tile; it does not repack or dequantize the matrix. Because one 162-byte row
-does not meet the AIE DMA four-byte length constraint, the IRON transfer pairs
-two adjacent native rows into exact 324-byte transactions. The host converts
-only the 288-element activation to BF16. It page-registers the immutable GGML
+on-tile; it does not repack or dequantize the matrix. The host converts only
+the 288-element activation to BF16. It page-registers the immutable GGML
 weight buffer once, uses root-derived sub-BOs for weights, explicitly
 cache-flushes each new weight view once, reuses one command/run, and uses
 persistent activation/output BOs. It performs no weight copy and records XRT
 device/kernel initialization, registration, backend-created BOs, host-copy
-time, TO/FROM sync time, combined kernel start/wait time, and complete call
-time. Artifact parsing happens during backend registration before the runtime
-initialization timer. Kernel source and reproduction instructions are in
+time, TO/FROM sync time, separate XRT `start()` and `wait()` time, and complete
+call time. A size-aware v2 statistics API exposes those stage counters through
+dynamic backend lookup while preserving the original stats ABI. Artifact
+parsing happens during backend registration before the runtime initialization
+timer. Kernel source and reproduction instructions are in
 `ggml/src/ggml-xdna/kernels/aie2p/`.
 
-The generated Q4_0 bundle used for the final reviewed-code test is intentionally
-ignored by Git and has SHA-256
-`4aae43e71b1ef6eaca4189e35e15093baacdc6bddaae4e82a053ccc9dfa2a5f3`.
-It contains an xclbin with SHA-256
-`86be4509f87dedc2a0c756eae915bb70970fe0be5ab01fbc2fadaf020a403774`
-and a 420-byte instruction stream with SHA-256
-`50fa4300155c11d5cc1fa05619cdbb4dc5af3f3b3251d2a395003af363018390`.
+The clean-built nine-worker Q4_0 bundle used for the final physical tests is
+intentionally ignored by Git and has SHA-256
+`31c0d6bcd4e570b298fac81da801934a99682f0af62789170c5a3383487c583f`.
+It contains a 44,505-byte xclbin with SHA-256
+`38a1dc1dff9bb361ffcee9feed90c3942bdf91305ec0c40cf0de6faa1ece922a`
+and a 988-byte instruction stream with SHA-256
+`9e85c37d45e085ef2f597a554b913e9744bdabc558313ae5473808f4e0da15ed`.
+The generated MLIR and Peano object hashes are respectively
+`942590208bd114b5c92d77b3ee3c4634831fa02f65eea2f9eb64fabc356f10e5`
+and `2d7c750e15a93991e6b5b475aab633b3575930291a3019a3972761a0aabc0755`.
 The xclbin and therefore bundle are not bit-reproducible because the current
 toolchain writes a fresh UUID, timestamp, and unique ID; the kernel object,
 instruction stream, ABI header, and generated MLIR were deterministic across
@@ -263,34 +289,80 @@ run of 8,190 measured iterations reported 695.70 us/run, 238.45 MFLOP/s, one
 root registration, one weight view, 8,190 weight-view hits, and zero weight-copy
 bytes. The 165,888-byte BF16 matrix achieved about 0.238 GB/s.
 
-The direct Q4_0 artifact first completed 101 persistent hardware launches with
-zero mismatches and zero maximum error against a BF16-activation CPU reference.
-GGML's own CPU-comparison test then passed with random `Q4_0` tensor data. The
-final 8,192-run perf case measured 13,130.40 us/run, 12.63 MFLOP/s, and about
-0.003553 GB/s of native compressed weights. Backend counters showed 8,193
-submissions, one root registration, one weight view, 8,192 weight-view hits,
-exactly one 46,656-byte weight sync, and zero weight-copy bytes. The scalar
-one-core result is proof of native compressed execution rather than a
-performance candidate. The final fresh-process correctness run measured 115.516
-ms of XRT device/kernel initialization, a 13.071 ms first kernel, and a 13.183
-ms first complete call. In the long run, combined kernel start/waits totaled
-107,443.733 ms and complete calls 107,550.442 ms. Measured TO-device cache
-maintenance was 5.342 ms total (0.652 us/call), FROM-device maintenance was
-24.214 ms (2.955 us/call), and the two small host copies totaled 10.483 ms
-(1.280 us/call). The remaining measured call overhead was about 8.14 us/call.
-Each repeat maintained 576 activation bytes, 1,152 output bytes, converted 576
-bytes of F32 activation to BF16, and copied 1,152 output bytes to GGML. These
-byte counters describe cache maintenance and small activation/result movement
-on KMQ, not payload DMA to a second weight buffer.
+## AIE2P vector and multi-worker performance sprint
 
-The same GGML test in a simultaneous HIP+XDNA build passed on the Radeon 890M
-(`gfx1150`). The final focused HIP run measured 5.86 us/run and 28.33 GFLOP/s,
-or about 7.96 GB/s of compressed weights. HIP was about 2,241x faster than the
-current XDNA validation kernel. This is a firm no-go for the current scalar
-implementation, not for the optimized decode hypothesis. A pinned-toolchain
-defect was also isolated: depth-two forwarding corrupted one row on alternating
-launches; depth-one FIFOs passed both 20- and 101-launch tests and are
-intentionally used.
+The original scalar, one-worker artifact was re-run for 101 persistent launches
+after the rebase: 12,973.193 us steady and 0.003596 GB/s of native compressed
+weights. The optimized compute primitive now performs packed `uint4` vector
+loads, AIE2P nibble unpack/deinterleave, vector subtract-eight, int8-to-BF16
+conversion, vector MAC, and vector reduction. The final packed block in each
+32-row FIFO object uses an exact staged load because the fast unaligned AIE
+primitive may physically read a wider surrounding region.
+
+AIE2P/arch21 does not provide IEEE-FP16 arithmetic for GGML's scale. The kernel
+decodes the binary16 bits exactly to FP32, then deliberately rounds the scale to
+BF16 so block scaling stays on the vector datapath. That is a numerical contract
+change, not a bit-exact reordering. GGML's random CPU-reference test passes its
+Q4 tolerance. Separate physical patterns covered zero quant values, min/max
+nibbles, positive/negative small and large scales, deterministic random
+weights/activations, zero activation, and small/large activation magnitudes;
+all seven completed five persistent launches with zero mismatches. A 101-run
+structured test also had zero mismatches and zero maximum absolute error.
+
+Three row accumulators reuse each activation vector load. Four rows regressed
+because the pinned Peano compiler spilled vector state. The IRON program then
+instantiates the proven 32-row primitive nine times: workers `(0..7,2)` plus
+`(0,3)`. One shim stream broadcasts the activation to all workers. Native GGML
+weight rows and output rows are split/joined in `4 + 4 + 1` groups across memory
+tiles, respecting the five-input/five-output DMA-channel limit. No weight is
+repacked or dequantized, and no secondary weight allocation is introduced.
+
+An eight-worker, 36-row-per-worker topology also compiled, allocated, and
+routed, but returned deterministic incorrect results on hardware. A matching
+single-worker 36-row probe failed too, isolating the problem to that compiled
+36-row primitive rather than the multi-tile routes. It was not committed or
+used for timing; the proven 32-row primitive was retained and scaled to nine
+workers instead.
+
+The serial standalone XRT ladder below uses the same 46,656-byte matrix, 101
+persistent launches, and excludes the first launch from the steady average:
+
+| Artifact | Steady start+wait | Effective weight GB/s | Speedup vs scalar |
+| --- | ---: | ---: | ---: |
+| scalar single worker | 12,973.193 us | 0.003596 | 1.00x |
+| vector unpack/reduction, exact FP16 scale | 373.288 us | 0.124986 | 34.75x |
+| BF16-scaled, two-row activation reuse | 170.975 us | 0.272882 | 75.88x |
+| BF16-scaled, three-row activation reuse | 135.050 us | 0.345471 | 96.06x |
+| nine workers, three rows per inner step | **74.301 us** | **0.627932** | **174.60x** |
+
+Two final-source GGML perf runs measured 16,384 steady calls at 70.41 and 71.56
+us/run, 2.32-2.36 GFLOP/s, and **0.652-0.663 GB/s**. In the 70.41 us run, a
+fresh process spent 127.649 ms in XRT device/kernel initialization; its first
+kernel start+wait was 0.792 ms and its first complete backend call was 0.875
+ms. Across 16,385 successful calls, XRT
+`start()` averaged 1.962 us and `wait()` 67.296 us. Activation conversion,
+activation sync, output sync, and output copy averaged respectively 0.096,
+0.039, 0.059, and 0.230 us/call. One weight view was created and synced once;
+16,384 subsequent calls hit it, with zero weight-copy bytes.
+
+A minimal AIE2P increment design measured 65.224 us average start+wait (52.480
+us minimum) over 100 steady launches. It is a different program, so subtracting
+it does not yield an exact compute time, but it shows that the final 288x288
+kernel is now close to the installed XRT/AIE command envelope rather than
+spending milliseconds in scalar arithmetic. The retained single-worker BF16
+reference remains slow at 693.76 us/run and is not an optimized comparator.
+
+The exact GGML HIP test on the Radeon 890M (`gfx1150`) measured 5.91 us/run,
+28.07 GFLOP/s, and about 7.895 GB/s. The optimized XDNA result is therefore
+about 12x slower than HIP for this very small operation, versus more than
+2,000x for the original scalar artifact. Vectorization and multi-worker scaling
+removed the catastrophic underutilization, but this fixed shape is not yet a
+decode-performance win over HIP.
+
+A pinned-toolchain defect remains isolated: depth-two forwarding corrupted one
+row on alternating launches. The nine-worker artifact keeps every FIFO at depth
+one and gains parallelism through independent workers. It makes no DMA/compute
+overlap claim; ping-pong must be a separate artifact and physical A/B test.
 
 ## Hybrid scheduling and real-GGUF evidence
 
@@ -331,18 +403,18 @@ temporary scheduler traffic rather than a persistent second full-model copy,
 but it proves that current HIP does not directly consume the same plain CPU
 buffer that XRT registers.
 
-A final three-token CLI run on the reviewed output-buffer design issued 48
-XDNA kernels across two repeated decode graphs: 24 unique weight views followed
-by 24 cache hits. The one-time weight sync remained fixed at 24 calls /
-1,119,744 bytes, one page-root registration covered the 17.504 MiB model
-allocation, and weight-copy bytes remained zero. Combined kernel start/waits
-totaled 609.096 ms and complete XDNA calls 610.432 ms; TO/FROM cache maintenance
-and activation/result host copies were separately 0.031/0.043/0.022 ms. That
-projects to about 3.28 steady tokens/s from the 24 scalar NPU projections alone,
-before optimizing the kernel. The CLI reported 2,492.1 prompt tokens/s and 4.8
-generation tokens/s for this very short aggregate; the first sampled token is
-produced by prompt evaluation, so the projected repeated-decode figure is the
-relevant one.
+A final three-token CLI run with the nine-worker artifact issued 48 XDNA kernels
+across two decode graphs: 24 unique weight views followed by 24 cache hits. The
+one-time weight sync remained fixed at 24 calls / 1,119,744 bytes, one page-root
+registration covered the 17.504 MiB model allocation, and weight-copy bytes
+remained zero. The actual `Qcur-0` node was logged on variant
+`aie2p-q4_0-gemv-m288-n1-k288`. All 48 XRT start+wait intervals totaled 4.325
+ms and complete XDNA calls totaled 5.558 ms; 1.132 ms of that run was the first
+registration of the 24 weight views. Activation packing/sync, output sync, and
+output copy totaled 0.006/0.007/0.005/0.012 ms. The short end-to-end run reported
+473.2 prompt tokens/s and 184.9 generation tokens/s; this tiny model result is
+proof that the optimized graph path remains live, not a production-model
+throughput projection.
 
 An all-HIP end-to-end comparison could not run on this host: the locally staged
 rocBLAS package lacks a `gfx1150` Tensile library and aborts with `Illegal seek
@@ -358,14 +430,41 @@ build/bin/test-backend-ops test -b XDNA0 -o MUL_MAT \
   -p 'type_a=q4_0,type_b=f32,m=288,n=1,k=288'
 ```
 
-## Next compute step
+## Decode shape census and next compute step
 
-The direct Q4_0 contract now executes genuine attention projections in a small
-LLM, but the implementation remains a scalar, single-tile validation kernel.
-The next gate is a production-size LLM linear layer with AIE2P packed-int4
-vector unpack, multi-tile row distribution, and vector/F32 accumulation. It
-must retain native GGML bytes and validate CPU equivalence before each shape
-enters `supports_op`. AIE2 needs a separate unpack implementation.
+GGUF tensor dimensions are listed below as decode `M x K` (`N=1`), not the
+reader's `[ne0, ne1]` storage display:
+
+| Model | Projection | Decode shape | Stored type |
+| --- | --- | ---: | --- |
+| stories15M (hidden 288, FFN 768) | Q/K/V/output | 288 x 288 | Q4_0 |
+| stories15M | gate/up | 768 x 288 | Q4_0 |
+| stories15M | down | 288 x 768 | Q4_0 |
+| Gemma 4 E4B (hidden 2560, FFN 10240) | Q | 2048 x 2560 | Q4_0 |
+| Gemma 4 E4B | K/V | 512 x 2560 | Q4_0 |
+| Gemma 4 E4B | attention output | 2560 x 2048 | Q4_0 |
+| Gemma 4 E4B | gate/up | 10240 x 2560 | Q4_0 |
+| Gemma 4 E4B | down | 2560 x 10240 | Q4_1 |
+| Gemma 4 12B (hidden 3840, FFN 15360) | Q | 4096 x 3840 | Q4_0 |
+| Gemma 4 12B | K/V | 2048 x 3840 | Q4_0 |
+| Gemma 4 12B | attention output | 3840 x 4096 | Q4_0 |
+| Gemma 4 12B | gate/up | 15360 x 3840 | Q4_0 |
+| Gemma 4 12B | down | 3840 x 15360 | Q4_1 |
+
+The next specialized family should therefore target Q4_0 Q/K/V/output and
+gate/up shapes, beginning with the locally available E4B model. Q4_1 down
+projections require a separate format contract. Each admitted shape remains a
+registry entry with its own worker/DMA geometry and correctness tolerance; it
+does not add shape switches to GGML or the XDNA runtime.
+
+The 288x288 result is now near the measured command envelope, so the next
+performance questions differ from the scalar bring-up: whether production-size
+weights make XDNA bandwidth competitive, whether a persistent-program or
+multi-operation strategy can amortize the roughly 65 us launch floor, and
+whether a separate ping-pong topology can overlap DMA safely. Depth-two
+forwarding remains disabled until that artifact passes repeated physical
+correctness. AIE2 requires its own implementation and is not inferred from the
+tested AIE2P kernel.
 
 ## Go/no-go checkpoint
 
@@ -376,8 +475,8 @@ enters `supports_op`. AIE2 needs a separate unpack implementation.
 | Fundamentally UMA/system-backed weights? | **GO for writable host allocations on XDNA**; XRT maps the original pointer. HIP currently stages CPU-owned prompt weights instead of directly sharing that buffer. |
 | Reuse without per-token weight copy? | **GO for model-lifetime immutable buffers**: persistent parent/view/run, constant registrations, zero weight-copy bytes. **NO for arbitrary buffer lifetimes** until registration ownership moves into an XDNA buffer type. |
 | Ordinary read-only GGUF mmap? | **NO on the installed driver**; XDNA rejects `CPU_Mapped`, so default loading falls back safely. Upstream's driver fix exists but is not yet physically validated here. |
-| Quantized batch-one GEMV? | **GO for native 288x288 Q4_0 and a small real LLM**; production-size shapes and optimization remain open. |
-| ROCm comparison and hybrid value? | **Scheduling GO, current kernel performance NO-GO**: constructed and real graphs select ROCm prefill/XDNA decode, but HIP is about 2,241x faster for the exact operation. Production shared-HIP-buffer policy remains open. |
+| Quantized batch-one GEMV? | **GO for optimized native 288x288 Q4_0 and a small real LLM**: vector unpack/MAC and nine workers are physically correct, 174-184x faster than scalar. Production-size variants remain open. |
+| ROCm comparison and hybrid value? | **Scheduling GO, performance still NO-GO for this shape**: constructed and real graphs select ROCm prefill/XDNA decode, but HIP remains about 12x faster for the exact 288x288 operation. Production shapes and shared-HIP-buffer policy remain open. |
 | NPU utilization and energy? | **OPEN**: installed XRT/sysfs exposes neither a per-kernel utilization/energy counter nor estimated NPU power (`Estimated Power: N/A`); external SoC telemetry is required. |
 
 The experiment is a no-go if direct-layout Q4_0 cannot beat HIP after activation
