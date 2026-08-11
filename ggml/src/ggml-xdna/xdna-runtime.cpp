@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cinttypes>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -35,25 +36,24 @@ namespace ggml_xdna {
 
 namespace {
 
-constexpr int64_t gemv_rows = 288;
-constexpr int64_t gemv_columns = 288;
-constexpr size_t gemv_activation_bytes = gemv_columns * sizeof(ggml_bf16_t);
-constexpr size_t gemv_output_bytes = gemv_rows * sizeof(float);
 constexpr size_t artifact_header_bytes = 64;
-constexpr uint32_t artifact_abi_version = 1;
 constexpr char artifact_magic[8] = { 'G', 'G', 'X', 'D', 'N', 'A', '1', '\0' };
 
-std::string architecture_from_name(const std::string & name) {
+device_architecture architecture_from_device_name(const std::string & name) {
     if (name == "RyzenAI-npu4" || name == "RyzenAI-npu5" || name == "RyzenAI-npu6") {
-        return "AIE2P/XDNA2";
+        return device_architecture::aie2p;
     }
     if (name == "RyzenAI-npu1") {
-        return "AIE2/XDNA";
+        return device_architecture::aie2;
     }
-    if (name.rfind("RyzenAI-npu", 0) == 0) {
+    return device_architecture::unknown;
+}
+
+std::string architecture_description(const std::string & name, device_architecture architecture) {
+    if (architecture == device_architecture::unknown && name.rfind("RyzenAI-npu", 0) == 0) {
         return "XDNA (generation not validated)";
     }
-    return "unknown XDNA";
+    return architecture_name(architecture);
 }
 
 bool is_xdna_device_name(const std::string & name) {
@@ -72,24 +72,12 @@ uint64_t read_le64(const unsigned char * value) {
            (static_cast<uint64_t>(read_le32(value + 4)) << 32u);
 }
 
-size_t expected_weight_bytes(kernel_kind kind) {
-    switch (kind) {
-        case kernel_kind::bf16_gemv_288:
-            return gemv_rows * gemv_columns * sizeof(ggml_bf16_t);
-        case kernel_kind::q4_0_gemv_288:
-            return gemv_rows * (gemv_columns / 32) * 18;
-        case kernel_kind::none:
-            break;
-    }
-    return 0;
-}
-
 struct artifact_contents {
     std::vector<char> xclbin_data;
     std::vector<uint32_t> instructions;
 };
 
-artifact_contents read_artifact_bundle(const std::string & path, kernel_kind expected_kind) {
+artifact_contents read_artifact_bundle(const std::string & path, const xdna_kernel_variant & variant) {
     std::ifstream stream(path, std::ios::binary | std::ios::ate);
     if (!stream) {
         throw std::runtime_error("failed to open XDNA artifact bundle " + path);
@@ -109,14 +97,14 @@ artifact_contents read_artifact_bundle(const std::string & path, kernel_kind exp
 
     if (std::memcmp(bytes.data(), artifact_magic, sizeof(artifact_magic)) != 0 ||
             read_le32(bytes.data() + 8) != artifact_header_bytes ||
-            read_le32(bytes.data() + 12) != artifact_abi_version ||
-            read_le32(bytes.data() + 16) != static_cast<uint32_t>(expected_kind) ||
-            read_le32(bytes.data() + 20) != gemv_rows ||
-            read_le32(bytes.data() + 24) != gemv_columns ||
-            read_le32(bytes.data() + 28) != expected_weight_bytes(expected_kind) ||
-            read_le32(bytes.data() + 32) != gemv_activation_bytes ||
-            read_le32(bytes.data() + 36) != gemv_output_bytes ||
-            read_le64(bytes.data() + 56) != 0) {
+            read_le32(bytes.data() + 12) != variant.artifact_abi_version ||
+            read_le32(bytes.data() + 16) != variant.artifact_kind ||
+            read_le32(bytes.data() + 20) != variant.m ||
+            read_le32(bytes.data() + 24) != variant.k ||
+            read_le32(bytes.data() + 28) != variant.weight_bytes ||
+            read_le32(bytes.data() + 32) != variant.device_activation_bytes ||
+            read_le32(bytes.data() + 36) != variant.device_output_bytes ||
+            read_le64(bytes.data() + 56) != 0 || variant.n != 1) {
         throw std::runtime_error("XDNA artifact ABI metadata mismatch in " + path);
     }
 
@@ -225,7 +213,8 @@ std::vector<device_info> discover_devices(std::string * error) noexcept {
             info.index = i;
             info.name = name;
             info.bdf = device.get_info<xrt::info::device::bdf>();
-            info.architecture = architecture_from_name(name);
+            info.arch = architecture_from_device_name(name);
+            info.architecture = architecture_description(name, info.arch);
             result.emplace_back(std::move(info));
         }
     } catch (const std::exception & e) {
@@ -243,67 +232,45 @@ std::vector<device_info> discover_devices(std::string * error) noexcept {
 kernel_configuration probe_kernel_configuration(const device_info & info) noexcept {
     kernel_configuration result;
     try {
-        if (info.architecture != "AIE2P/XDNA2") {
+        size_t variant_count = 0;
+        const xdna_kernel_variant * variants = kernel_variants(&variant_count);
+        bool architecture_has_variant = false;
+        for (size_t i = 0; i < variant_count; ++i) {
+            const xdna_kernel_variant & variant = variants[i];
+            if (variant.architecture != info.arch) {
+                continue;
+            }
+            architecture_has_variant = true;
+            const char * artifact = std::getenv(variant.environment_variable);
+            if (artifact == nullptr || artifact[0] == '\0') {
+                continue;
+            }
+
+            result.variant = &variant;
+            result.artifact_path = artifact;
+            result.status = std::string(variant.description) + " configured";
+            artifact_contents contents = read_artifact_bundle(result.artifact_path, variant);
+            result.xclbin_data = std::move(contents.xclbin_data);
+            result.instructions = std::move(contents.instructions);
+            result.available = true;
+            return result;
+        }
+
+        if (!architecture_has_variant) {
             result.status = "no validated kernel for " + info.architecture;
-            return result;
-        }
-
-        const char * q4_artifact = std::getenv("GGML_XDNA_AIE2P_Q4_0_GEMV_BUNDLE");
-        const char * bf16_artifact = std::getenv("GGML_XDNA_AIE2P_BF16_GEMV_BUNDLE");
-
-        if (q4_artifact != nullptr && q4_artifact[0] != '\0') {
-            result.kind = kernel_kind::q4_0_gemv_288;
-            result.artifact_path = q4_artifact;
-            result.status = "AIE2P Q4_0xF32 decode GEMV 288x288 configured";
-        } else if (bf16_artifact != nullptr && bf16_artifact[0] != '\0') {
-            result.kind = kernel_kind::bf16_gemv_288;
-            result.artifact_path = bf16_artifact;
-            result.status = "AIE2P BF16xF32 decode GEMV 288x288 configured";
         } else {
-            result.status = "no Q4_0 or BF16 AIE2P GEMV artifact bundle configured";
-            return result;
+            result.status = "no registered kernel artifact bundle configured for " + info.architecture;
         }
-
-        artifact_contents artifact = read_artifact_bundle(result.artifact_path, result.kind);
-        result.xclbin_data = std::move(artifact.xclbin_data);
-        result.instructions = std::move(artifact.instructions);
-        result.available = true;
     } catch (const std::exception & e) {
         result.available = false;
-        result.kind = kernel_kind::none;
+        result.variant = nullptr;
         result.status = std::string("kernel configuration failed: ") + e.what();
     } catch (...) {
         result.available = false;
-        result.kind = kernel_kind::none;
+        result.variant = nullptr;
         result.status = "unknown kernel configuration failure";
     }
     return result;
-}
-
-bool supports_op_contract(const ggml_tensor * op, kernel_kind kind) noexcept {
-    if (op == nullptr || op->op != GGML_OP_MUL_MAT || op->type != GGML_TYPE_F32 ||
-            op->src[0] == nullptr || op->src[1] == nullptr ||
-            ggml_get_op_params_i32(op, 0) != GGML_PREC_DEFAULT ||
-            ggml_get_op_params_i32(op, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
-        return false;
-    }
-
-    const ggml_tensor * weights = op->src[0];
-    const ggml_tensor * activation = op->src[1];
-    if (weights->buffer != nullptr &&
-            ggml_backend_buffer_get_usage(weights->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
-        return false;
-    }
-    const bool weight_type_supported =
-        (kind == kernel_kind::bf16_gemv_288 && weights->type == GGML_TYPE_BF16) ||
-        (kind == kernel_kind::q4_0_gemv_288 && weights->type == GGML_TYPE_Q4_0);
-    return weight_type_supported && activation->type == GGML_TYPE_F32 &&
-           weights->ne[0] == gemv_columns && weights->ne[1] == gemv_rows &&
-           weights->ne[2] == 1 && weights->ne[3] == 1 &&
-           activation->ne[0] == gemv_columns && activation->ne[1] == 1 &&
-           activation->ne[2] == 1 && activation->ne[3] == 1 &&
-           op->ne[0] == gemv_rows && op->ne[1] == 1 && op->ne[2] == 1 && op->ne[3] == 1 &&
-           ggml_is_contiguous(weights) && ggml_is_contiguous(activation) && ggml_is_contiguous(op);
 }
 
 struct runtime::impl {
@@ -332,10 +299,14 @@ struct runtime::impl {
 
     struct kernel_state {
         kernel_state(xrt::device & device, const kernel_configuration & configuration) {
+            if (configuration.variant == nullptr) {
+                throw std::runtime_error("XDNA kernel configuration has no selected variant");
+            }
+            const xdna_kernel_variant & variant = *configuration.variant;
             xclbin = std::make_unique<xrt::xclbin>(configuration.xclbin_data);
             device.register_xclbin(*xclbin);
             context = std::make_unique<xrt::hw_context>(device, xclbin->get_uuid());
-            kernel = std::make_unique<xrt::kernel>(*context, "MLIR_AIE");
+            kernel = std::make_unique<xrt::kernel>(*context, variant.xrt_kernel_name);
             instructions = configuration.instructions;
 
             instruction_bo = std::make_unique<xrt::bo>(
@@ -346,18 +317,18 @@ struct runtime::impl {
             instruction_sync_time_ns = elapsed_ns(instruction_sync_start, std::chrono::steady_clock::now());
 
             activation_bo = std::make_unique<xrt::bo>(
-                device, gemv_activation_bytes, xrt::bo::flags::host_only, kernel->group_id(4));
-            activation_data = activation_bo->map<ggml_bf16_t *>();
+                device, variant.device_activation_bytes, xrt::bo::flags::host_only, kernel->group_id(4));
+            activation_data = activation_bo->map<void *>();
             output_bo = std::make_unique<xrt::bo>(
-                device, gemv_output_bytes, xrt::bo::flags::host_only, kernel->group_id(5));
-            output_data = output_bo->map<float *>();
+                device, variant.device_output_bytes, xrt::bo::flags::host_only, kernel->group_id(5));
+            output_data = output_bo->map<void *>();
             temporary_bo = std::make_unique<xrt::bo>(
                 device, 1, xrt::bo::flags::host_only, kernel->group_id(6));
             trace_bo = std::make_unique<xrt::bo>(
                 device, 1, xrt::bo::flags::host_only, kernel->group_id(7));
 
             run = std::make_unique<xrt::run>(*kernel);
-            run->set_arg(0, 3u);
+            run->set_arg(0, variant.runtime_opcode);
             run->set_arg(1, *instruction_bo);
             run->set_arg(2, instructions.size());
             run->set_arg(4, *activation_bo);
@@ -376,13 +347,13 @@ struct runtime::impl {
         std::unique_ptr<xrt::bo> temporary_bo;
         std::unique_ptr<xrt::bo> trace_bo;
         std::unique_ptr<xrt::run> run;
-        ggml_bf16_t * activation_data = nullptr;
-        float * output_data = nullptr;
+        void * activation_data = nullptr;
+        void * output_data = nullptr;
         uint64_t instruction_sync_time_ns = 0;
     };
 
     impl(device_info value, const kernel_configuration & configuration) :
-        info(std::move(value)), device(info.index), kind(configuration.kind), kernel_status(configuration.status) {
+        info(std::move(value)), device(info.index), variant(configuration.variant), kernel_status(configuration.status) {
         if (!configuration.available) {
             return;
         }
@@ -391,7 +362,8 @@ struct runtime::impl {
             state = std::make_unique<kernel_state>(device, configuration);
             explicit_bo_creations.fetch_add(5);
             explicit_bo_creation_bytes.fetch_add(
-                state->instructions.size() * sizeof(uint32_t) + gemv_activation_bytes + gemv_output_bytes + 2);
+                state->instructions.size() * sizeof(uint32_t) + variant->device_activation_bytes +
+                variant->device_output_bytes + 2);
             sync_to_device_calls.fetch_add(1);
             sync_to_device_bytes.fetch_add(state->instructions.size() * sizeof(uint32_t));
             sync_to_device_time_ns.fetch_add(state->instruction_sync_time_ns);
@@ -472,7 +444,7 @@ struct runtime::impl {
 
     device_info info;
     xrt::device device;
-    kernel_kind kind;
+    const xdna_kernel_variant * variant = nullptr;
     std::string kernel_status;
     std::unique_ptr<kernel_state> state;
     std::vector<std::unique_ptr<root_registration>> roots;
@@ -530,7 +502,15 @@ const std::string & runtime::kernel_status() const noexcept {
 }
 
 bool runtime::supports_op(const ggml_tensor * op) const noexcept {
-    return kernel_available() && supports_op_contract(op, pimpl->kind);
+    if (!kernel_available() || pimpl->variant == nullptr) {
+        return false;
+    }
+    xdna_problem problem;
+    if (!problem_from_ggml(op, pimpl->info.arch, &problem)) {
+        return false;
+    }
+    const xdna_kernel_variant * candidates[] = { pimpl->variant };
+    return select_kernel_variant(problem, candidates, 1) != nullptr;
 }
 
 int runtime::compute(ggml_tensor * op) noexcept {
@@ -543,21 +523,31 @@ int runtime::compute(ggml_tensor * op) noexcept {
         // One persistent command BO/run is intentionally reused. Serialize it
         // until a future implementation provisions a bounded run pool.
         const std::lock_guard<std::mutex> lock(pimpl->compute_mutex);
+        const xdna_kernel_variant & variant = *pimpl->variant;
+        if (ggml_nbytes(op->src[0]) != variant.weight_bytes ||
+                variant.activation_type != data_type::f32 ||
+                variant.device_activation_type != data_type::bf16 ||
+                variant.output_type != data_type::f32 ||
+                variant.device_output_type != data_type::f32) {
+            throw std::runtime_error("selected XDNA kernel variant has an unsupported host storage conversion");
+        }
         xrt::bo & weight_bo = pimpl->register_weight(op->src[0]);
 
         const auto host_copy_start = std::chrono::steady_clock::now();
         ggml_fp32_to_bf16_row(
-            static_cast<const float *>(op->src[1]->data), pimpl->state->activation_data, gemv_columns);
+            static_cast<const float *>(op->src[1]->data),
+            static_cast<ggml_bf16_t *>(pimpl->state->activation_data),
+            variant.k * variant.n);
         pimpl->host_copy_time_ns.fetch_add(
             elapsed_ns(host_copy_start, std::chrono::steady_clock::now()));
         pimpl->host_copy_calls.fetch_add(1);
-        pimpl->host_copy_bytes.fetch_add(gemv_activation_bytes);
+        pimpl->host_copy_bytes.fetch_add(variant.device_activation_bytes);
         const auto activation_sync_start = std::chrono::steady_clock::now();
-        pimpl->state->activation_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE, gemv_activation_bytes, 0);
+        pimpl->state->activation_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE, variant.device_activation_bytes, 0);
         pimpl->sync_to_device_time_ns.fetch_add(
             elapsed_ns(activation_sync_start, std::chrono::steady_clock::now()));
         pimpl->sync_to_device_calls.fetch_add(1);
-        pimpl->sync_to_device_bytes.fetch_add(gemv_activation_bytes);
+        pimpl->sync_to_device_bytes.fetch_add(variant.device_activation_bytes);
         host_memory_fence();
 
         pimpl->state->run->set_arg(3, weight_bo);
@@ -574,30 +564,32 @@ int runtime::compute(ggml_tensor * op) noexcept {
         }
 
         const auto output_sync_start = std::chrono::steady_clock::now();
-        pimpl->state->output_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE, gemv_output_bytes, 0);
+        pimpl->state->output_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE, variant.device_output_bytes, 0);
         pimpl->sync_from_device_time_ns.fetch_add(
             elapsed_ns(output_sync_start, std::chrono::steady_clock::now()));
         pimpl->sync_from_device_calls.fetch_add(1);
-        pimpl->sync_from_device_bytes.fetch_add(gemv_output_bytes);
+        pimpl->sync_from_device_bytes.fetch_add(variant.device_output_bytes);
         host_memory_fence();
 
         const auto output_copy_start = std::chrono::steady_clock::now();
-        std::memcpy(op->data, pimpl->state->output_data, gemv_output_bytes);
+        std::memcpy(op->data, pimpl->state->output_data, variant.device_output_bytes);
         pimpl->host_copy_time_ns.fetch_add(
             elapsed_ns(output_copy_start, std::chrono::steady_clock::now()));
         pimpl->host_copy_calls.fetch_add(1);
-        pimpl->host_copy_bytes.fetch_add(gemv_output_bytes);
+        pimpl->host_copy_bytes.fetch_add(variant.device_output_bytes);
 
         const uint64_t total_ns = elapsed_ns(total_start, std::chrono::steady_clock::now());
         pimpl->total_compute_time_ns.fetch_add(total_ns);
         if (submission == 1) {
             pimpl->first_kernel_time_ns.store(kernel_ns);
             pimpl->first_compute_time_ns.store(total_ns);
-            const char * weight_type = pimpl->kind == kernel_kind::q4_0_gemv_288 ? "Q4_0" : "BF16";
             GGML_LOG_INFO(
-                "ggml_xdna: executed GGML_OP_MUL_MAT node '%s' on XDNA: %s[288,288] x F32[288,1], "
+                "ggml_xdna: executed GGML_OP_MUL_MAT node '%s' on XDNA variant '%s': "
+                "%s[M=%" PRId64 ",K=%" PRId64 "] x %s[K=%" PRId64 ",N=%" PRId64 "], "
                 "kernel %.3f ms, total %.3f ms, weight copies 0 bytes\n",
-                op->name, weight_type, kernel_ns / 1.0e6, total_ns / 1.0e6);
+                op->name, variant.id, data_type_name(variant.weights_type), variant.m, variant.k,
+                data_type_name(variant.activation_type), variant.k, variant.n,
+                kernel_ns / 1.0e6, total_ns / 1.0e6);
         }
         return 0;
     } catch (const std::exception & e) {
