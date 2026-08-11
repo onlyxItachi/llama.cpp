@@ -238,7 +238,7 @@ static ggml_backend_buffer_type_t ggml_backend_xdna_device_get_buffer_type(ggml_
 
 static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     auto * dev_ctx = static_cast<xdna_device_context *>(dev->context);
-    if (!dev_ctx->kernel_configuration.available || dev_ctx->kernel_configuration.variant == nullptr) {
+    if (!dev_ctx->kernel_configuration.available) {
         return false;
     }
 
@@ -257,8 +257,7 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const g
     if (!ggml_xdna::problem_from_ggml(op, dev_ctx->info.arch, &problem)) {
         return false;
     }
-    const ggml_xdna::xdna_kernel_variant * candidates[] = { dev_ctx->kernel_configuration.variant };
-    return ggml_xdna::select_kernel_variant(problem, candidates, 1) != nullptr;
+    return ggml_xdna::select_kernel_configuration(dev_ctx->kernel_configuration, problem) != nullptr;
 }
 
 static bool ggml_backend_xdna_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
