@@ -288,26 +288,36 @@ GGML_OP_MUL_MAT + tensor metadata
 
 Each registry entry owns its shape, architecture, artifact ABI, XRT symbol,
 opcode, byte sizes, and worker geometry. The AIE2P Q4_0 288x1x288,
-512x1x2560, and 10240x1x2560 kernels plus the BF16 reference are entries, not
-switch cases scattered across the backend/runtime. The artifact packer
+512x1x2560, and 10240x1x2560 kernels, the Q8_0 9216x1x2560 kernel, and the BF16
+reference are entries, not switch cases scattered across the backend/runtime.
+The artifact packer
 likewise receives metadata from the shape-specific build instead of
 maintaining a second dtype/shape table. This is deliberately a specialization
 registry, not a universally dynamic kernel.
 
 The runtime now discovers every configured registered bundle, validates each one independently, and constructs one XCLBIN/context/kernel state per valid artifact with a normally persistent, lazily recreated run.
 Both device capability reporting and execution use the same `xdna_problem` selector.
-A physical process loaded the Q4_0 288x288, BF16 288x288, Q4_0 512x2560, and Q4_0 10240x2560 full-array artifacts simultaneously and passed all four CPU-reference tests.
+A physical process loaded the Q4_0 288x288, BF16 288x288, Q4_0 512x2560,
+Q4_0 10240x2560, and Q8_0 9216x2560 full-array artifacts simultaneously and
+passed all five CPU-reference tests. The integrated run recorded five
+submissions, five root registrations covering 38.891 MiB, five one-time weight
+syncs, and zero weight-copy bytes. Its retained log has SHA-256
+`66e21a1318ea4b5701297b988b87b7612fcbaa0f5f972f6c9cafc5b8d14726fd`.
 The combined log `four-variant-quiescence.log` has SHA-256 `c27483c71049f26399f089d1b74e97e5ebdb49cd4e2c787339f9020e68df869e`.
-This proves that the installed XRT stack permits the four persistent full-array contexts after the lifetime and run-quiescence changes; it does not exercise an injected `wait()` failure.
+Together these runs prove that the installed XRT stack permits five persistent
+full-array contexts after the lifetime and run-quiescence changes; they do not
+exercise an injected `wait()` failure.
 UMA weight registrations remain shared across those states.
 Malformed optional bundles are rejected without hiding valid variants; an XRT load failure rejects the complete backend instance so capability reporting cannot advertise an unavailable state.
 
 The configured variant accepts only its exact contract:
 
 - `GGML_OP_MUL_MAT`;
-- contiguous native `Q4_0[288,288] x F32[288,1] -> F32[288,1]`,
+- one of the contiguous native contracts
+  `Q4_0[288,288] x F32[288,1] -> F32[288,1]`,
   `Q4_0[2560,512] x F32[2560,1] -> F32[512,1]`,
-  `Q4_0[2560,10240] x F32[2560,1] -> F32[10240,1]`, or the retained
+  `Q4_0[2560,10240] x F32[2560,1] -> F32[10240,1]`,
+  `Q8_0[2560,9216] x F32[2560,1] -> F32[9216,1]`, or the retained
   `BF16[288,288]` plumbing reference;
 - one AIE2P/XDNA2 device and an explicitly configured versioned artifact bundle.
 
@@ -321,10 +331,12 @@ the generated bundles. The configured bundle is still a trusted executable
 input; its header does not authenticate the semantics of a manually relabeled
 arbitrary xclbin.
 
-Every prefill/batched shape and every other dtype is rejected. The Q4_0 kernel
-reads the native 18-byte `block_q4_0` representation and decodes scale/nibbles
-on-tile; it does not repack or dequantize the matrix. The host converts only
-the small activation vector to BF16. For immutable model weights it
+Every prefill/batched shape and every other unregistered dtype/shape is
+rejected. The Q4_0 kernel reads the native 18-byte `block_q4_0` representation
+and decodes scale/nibbles on-tile; the Q8_0 kernel reads the native 34-byte
+`block_q8_0` scale/int8 representation. Neither kernel repacks nor materializes
+a dequantized matrix. The host converts only the small activation vector to
+BF16. For immutable model weights it
 page-registers each selected tensor window once, uses root-derived sub-BOs,
 explicitly cache-flushes each new weight view once, reuses one command/run per
 selected artifact, and uses persistent activation/output BOs. That path
@@ -531,6 +543,90 @@ valuable because it covers the majority of compressed E4B linear-weight traffic
 and exposes the real XDNA bandwidth regime, not because it currently wins
 device selection.
 
+## Native Q8_0 production-shape milestone
+
+The first non-Q4 quantized production specialization targets the exact Qwen
+3.5 4B gate/up decode operation: native
+`Q8_0[M=9216,K=2560] x F32[K=2560,N=1]`. The 32-layer model executes two such
+projections per layer, so this one descriptor represents 64 calls and
+1,604,321,280 native Q8_0 weight bytes per generated token. Selection remains
+generic: architecture, operation, dtype, layout, M/N/K, batches, and weight
+lifetime determine capability; neither the registry nor runtime checks a model
+name.
+
+Each native `block_q8_0` is the GGML 34-byte layout: one IEEE FP16 scale and 32
+signed int8 lanes. A K=2560 row is 2,720 bytes and the complete M=9216 matrix
+is 25,067,520 bytes. The retained eight-stream IRON topology maps four 16-row
+workers to each of eight memory-tile groups, uses all 32 compute tiles for one
+512-row wave, and completes the matrix in 18 waves. A worker transfer is
+43,520 bytes, or 10,880 of the AIE2P core DMA descriptor's 16,383 available
+32-bit granules. The activation is broadcast once and held across all waves;
+FIFOs remain depth one and four waves share each controller task group.
+
+The host packs only the 5,120-byte F32 activation to BF16. On-tile code converts
+the FP16 block scale to FP32 and then rounds it to BF16, converts the signed
+lanes to BF16, rounds the scaled lane vector to BF16, and performs BF16 MACs
+into F32 accumulators. This is an explicit numerical contract rather than an
+exact FP16-scale reorder. The final row and final 34-byte block use exact local
+tail staging so the fast unaligned vector load cannot read outside the worker
+FIFO object.
+
+The MIT compute source and Apache-2.0-with-LLVM-exception IRON generator were
+built with MLIR-AIE 1.3.4 and Peano commit
+`cb664e8cc3eb42a12e3ad3cee28729785ffa97a3`. Explicit Peano `-O2` and `-O3`
+builds were byte-identical: a 2,892-byte object with a 1,920-byte text section
+and SHA-256
+`231e12d85ed26c1f5585f21fa1876e6de72d0154e854900f35e84aa3604c9f9f`.
+The Makefile therefore retains `-O2`. The local generated ABI-v1/kind-3 bundle
+is 237,139 bytes with SHA-256
+`1a8b653d0de85f65825b389e50529bf5b17091c7780feae33367713985c73cdf`;
+its 41,076-byte instruction stream has SHA-256
+`cd1f298f20b075ef3b8d22e3402e56d49028227e39ab63a190b55087b85d7482`.
+Generated binaries remain ignored by Git.
+
+The deterministic GGML backend test passed against the CPU backend at the exact
+shape. A standalone physical CPU-reference suite additionally covered zero
+weights, zero activation, three fixed random seeds, int8 -128/+127 lanes,
+zero/positive/negative/small/large FP16 scales, and the last row/block. The
+zero cases were exact. Against a CPU calculation of the kernel's explicit
+BF16-rounded dequant semantics, the seeded cases measured NMSE from
+`3.99554e-13` through `4.17706e-13`, maximum absolute error from `0.0185547`
+through `0.0234375`, and final-row error from `0.00146484` through `0.00634766`.
+No NaN or tolerance failure occurred. The GGML CPU comparison separately
+guards the public F32-input tolerance rather than treating this internal
+BF16-semantics reference as a substitute.
+The committed deterministic test includes FP16 scales derived from `0.0007f`
+and `-0.0137f`, which are not BF16-exact, so it directly exercises the
+production FP16-to-BF16 scale-rounding difference in addition to zero and
+power-of-two edge values.
+
+Five persistent `test-backend-ops` processes completed 10,605 physical
+submissions. Their per-process means were 792.26, 799.01, 794.53, 790.70, and
+799.07 us/call; the median is 794.53 us, 31.55 decimal GB/s over native Q8_0
+bytes, and 59.39 GFLOP/s. Each immutable weight was registered and synchronized
+once per process; steady calls copied zero weight payload bytes.
+
+A bounded 15-weight-stream experiment used the same compute object, 32 tiles,
+16 rows per worker, 18 waves, depth-one FIFOs, and four-wave task grouping. It
+passed the same directed reference, but enlarged the controller instruction
+stream from 41,076 to 76,860 bytes. In balanced adjacent order, the retained
+eight-stream medians were 794.821, 786.061, 785.790, and 786.281 us; the
+15-stream medians were 882.902, 883.482, 875.522, and 875.182 us. The candidate
+lost every pair and was 11.84% slower by aggregate median, so it remains
+cache-only and is not a registry variant.
+
+The exact `gfx1151` HIP operation independently passed a deterministic CPU test
+and measured 269.80 us median across five device-resident `test-backend-ops`
+processes, or 92.91 GB/s and 174.89 GFLOP/s. A separate synchronized allocation
+probe measured 247.858 and 268.538 us from ROCm device memory and 290.578 and
+282.668 us directly from `ROCm_Host`; direct-host output was bit-identical and
+incurred zero weight copy. Explicit generic-CPU staging plus compute was about
+786-819 us and is not conflated with the HIP kernel ceiling. The comparable
+GGML throughput result makes the current XDNA artifact about 2.94x slower.
+Consequently the policy-enabled descriptor must set
+`prefer_for_offload=false`; Q8_0 capability is a format/shape milestone, not an
+automatic hybrid-performance win.
+
 A pinned-toolchain defect remains isolated: depth-two forwarding corrupted one
 row on alternating launches. The nine-worker artifact keeps every FIFO at depth
 one and gains parallelism through independent workers. The production gate/up
@@ -652,6 +748,7 @@ reader's `[ne0, ne1]` storage display:
 | Gemma 4 E4B | attention output | 2560 x 2048 | Q4_0 |
 | Gemma 4 E4B | gate/up | 10240 x 2560 | Q4_0 |
 | Gemma 4 E4B | down | 2560 x 10240 | Q4_1 |
+| Qwen 3.5 4B (hidden 2560, FFN 9216) | gate/up | 9216 x 2560 | Q8_0 |
 | Gemma 4 12B (hidden 3840, FFN 15360) | Q | 4096 x 3840 | Q4_0 |
 | Gemma 4 12B | K/V | 2048 x 3840 | Q4_0 |
 | Gemma 4 12B | attention output | 3840 x 4096 | Q4_0 |
@@ -686,12 +783,21 @@ backend-driven graph-reordering API is not justified yet.
 
 The next specialized family should target the remaining E4B Q4_0 Q and
 attention-output projections. Q4_1 down projections require a separate format
-contract. Each admitted shape remains a registry entry with its own worker/DMA
-geometry and correctness tolerance; it does not add shape switches to GGML or
-the XDNA runtime.
+contract. The Qwen 3.5 Q8_0 milestone demonstrates materially higher XDNA
+weight bandwidth, but its same-shape HIP result remains 2.94x faster; any next
+Q8_0 projection must be selected from an actual graph byte/call census rather
+than inferred from this one specialization. Each admitted shape remains a
+registry entry with its own worker/DMA geometry and correctness tolerance; it
+does not add shape switches to GGML or the XDNA runtime.
 
-The measured regimes now separate cleanly: 288x288 and 512x2560 are dominated by the command envelope, while 10240x2560 exposes sustained kernel/dataflow throughput.
-The next high-value questions are whether compute-tile codegen or a safe explicit ping-pong topology can move beyond 19.25 GB/s, whether the model loader can provision large `ROCm_Host` allocations reliably, whether the read-only mmap gate passes after a driver upgrade, and whether concurrent compute/free/teardown can be given a safe contract.
+The measured regimes now separate cleanly: 288x288 and 512x2560 are dominated
+by the command envelope, while Q4_0 10240x2560 and Q8_0 9216x2560 expose
+sustained kernel/dataflow throughput at 19.25 and 31.55 GB/s respectively.
+The next high-value questions are whether compute-tile codegen or a safe
+explicit ping-pong topology can move beyond those bandwidths, whether the model
+loader can provision large `ROCm_Host` allocations reliably, whether the
+read-only mmap gate passes after a driver upgrade, and whether concurrent
+compute/free/teardown can be given a safe contract.
 Depth-two forwarding remains disabled; four-wave depth-one task groups are the largest stress-tested controller batch, while an eight-wave batch hung under sustained load.
 AIE2 requires its own implementation and is not inferred from the tested AIE2P kernel.
 
@@ -700,12 +806,12 @@ AIE2 requires its own implementation and is not inferred from the tested AIE2P k
 | Question | Current evidence |
 | --- | --- |
 | Clean ACCEL registration and discovery? | **GO**: dynamic `XDNA0`, real XRT/plugin/device-node path. |
-| Real GGML `MUL_MAT` on XDNA? | **GO for fixed Q4_0 and BF16 shapes**; CPU comparisons pass and a real GGUF `Qcur-0` node executed. |
+| Real GGML `MUL_MAT` on XDNA? | **GO for fixed Q4_0, Q8_0, and BF16 shapes**; CPU comparisons pass, the exact Q8_0 production shape passes physically, and a real Q4_0 GGUF `Qcur-0` node executed. |
 | Fundamentally UMA/system-backed weights? | **GO for writable CPU and `ROCm_Host` allocations**: a physical HIP/XDNA probe consumed the same page-aligned system-memory weight pointer, with one XRT registration and no secondary weight copy. |
 | Reuse without per-token weight copy? | **GO for serialized immutable-buffer lifetimes**: persistent parent/view/run reuse has zero weight-copy bytes, and observer-driven eviction passes exact owner/base/data ABA reuse with two registrations and no hits. Mutable/test weights use one explicit native-byte staging copy per call. Concurrent compute/free/backend teardown is not claimed. |
 | Ordinary read-only GGUF mmap? | **NO on the installed driver, fail-closed automatically**: the complete file-backed `PROT_READ` parent/subview/sync probe fails with errno 12, leaving `mmap_support` and `CPU_Mapped` acceptance disabled. Upstream driver commit `ed8fb2dd172bde623d7112a1bd674fc0e3c4cae4` contains the required read-only pin/IOMMU path; only a successful post-upgrade runtime probe enables the positive path, which is not physically validated here. |
-| Quantized batch-one GEMV? | **GO for native 288x288, 512x2560, and 10240x2560 Q4_0 plus the 288x288 BF16 reference**. All four registered variants pass together in one physical backend instance; the production variants reach 6.91 and 19.25 GB/s without repacking or a secondary immutable-weight copy. Broader dtype/shape coverage remains open. |
-| ROCm comparison and hybrid value? | **Capability scheduling, shared weights, and a real small-GGUF hybrid graph GO; performance NO-GO for the measured isolated shapes.** The physical pre-policy path kept `pp32` off XDNA and executed 48 XDNA projections for `tg2` from one `ROCm_Host` model allocation, with persistent page-window registrations and zero immutable-weight copy. Current normal `[ROCm,XDNA,CPU]` order leaves mutually supported decode on ROCm; `GGML_XDNA_PREFER_OFFLOAD=1` is the explicit control for reproducing intentional XDNA placement. Fair synchronized HIP is about 4.4-5.0x faster at 512x2560 and 4.7-4.9x at 10240x2560; HIP is about 12x faster at 288x288. Fused K/V saves one XDNA command floor but remains slower than HIP, and the tested gate/up pair is slower than two optimized XDNA calls. No end-to-end hybrid performance win is claimed. |
+| Quantized batch-one GEMV? | **GO for native 288x288, 512x2560, and 10240x2560 Q4_0, native 9216x2560 Q8_0, plus the 288x288 BF16 reference**. All five variants pass together in one physical backend instance. Production Q4_0 reaches 6.91/19.25 GB/s and Q8_0 reaches 31.55 GB/s without repacking or a secondary immutable-weight copy. Broader dtype/shape coverage remains open. |
+| ROCm comparison and hybrid value? | **Capability scheduling, shared weights, and a real small-GGUF hybrid graph GO; performance NO-GO for the measured isolated shapes.** The physical pre-policy path kept `pp32` off XDNA and executed 48 XDNA projections for `tg2` from one `ROCm_Host` model allocation, with persistent page-window registrations and zero immutable-weight copy. Current normal `[ROCm,XDNA,CPU]` order leaves mutually supported decode on ROCm; `GGML_XDNA_PREFER_OFFLOAD=1` is the explicit control for reproducing intentional XDNA placement. Fair synchronized HIP is about 4.4-5.0x faster at Q4_0 512x2560, 4.7-4.9x at Q4_0 10240x2560, 2.94x at Q8_0 9216x2560, and about 12x at Q4_0 288x288. The Q8_0 descriptor therefore keeps `prefer_for_offload=false`. Fused K/V saves one XDNA command floor but remains slower than HIP, and the tested gate/up pair is slower than two optimized XDNA calls. No end-to-end hybrid performance win is claimed. |
 | NPU utilization and energy? | **OPEN**: installed XRT/sysfs exposes neither a per-kernel utilization/energy counter nor estimated NPU power (`Estimated Power: N/A`); external SoC telemetry is required. |
 
 The experiment is a no-go if direct-layout Q4_0 cannot beat HIP after activation

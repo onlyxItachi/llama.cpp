@@ -4814,6 +4814,84 @@ struct test_mul_mat_weight : public test_mul_mat {
     }
 };
 
+// Reproducible native-Q8_0 coverage for physically validated XDNA shapes.
+// The ordinary backend-op initializer intentionally uses random_device; this
+// version fixes every packed scale, quant, and activation value so repeated
+// CPU-reference runs exercise exactly the same bytes.
+struct test_mul_mat_weight_q8_0_deterministic : public test_mul_mat_weight {
+    using test_mul_mat_weight::test_mul_mat_weight;
+
+    struct q8_0_block {
+        ggml_fp16_t d;
+        int8_t qs[32];
+    };
+
+    static_assert(sizeof(q8_0_block) == 34);
+
+    static uint32_t mix32(uint32_t value) {
+        value ^= value >> 16u;
+        value *= 0x7feb352du;
+        value ^= value >> 15u;
+        value *= 0x846ca68bu;
+        value ^= value >> 16u;
+        return value;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_Q8_0) {
+                GGML_ASSERT(ggml_nbytes(t) % sizeof(q8_0_block) == 0);
+                std::vector<q8_0_block> blocks(ggml_nbytes(t) / sizeof(q8_0_block));
+                // Include FP16 values that are not BF16-exact so XDNA's
+                // documented scale-rounding contract remains covered.
+                constexpr float scale_cases[] = {
+                    0.0f, 0x1p-14f, -0x1p-14f, 0.0007f,
+                    -0.0137f, 0.5f, -1.0f, 4.0f,
+                };
+                for (size_t ib = 0; ib < blocks.size(); ++ib) {
+                    const uint64_t ib64 = static_cast<uint64_t>(ib);
+                    const uint32_t key = mix32(
+                        0x12345678u ^ static_cast<uint32_t>(ib) * 0x9e3779b9u ^
+                        static_cast<uint32_t>(ib64 >> 32));
+                    const float scale = ib + 1 == blocks.size() ? -4.0f : scale_cases[key & 7u];
+                    blocks[ib].d = ggml_fp32_to_fp16(scale);
+                    for (size_t iq = 0; iq < 32; ++iq) {
+                        const int32_t signed_value =
+                            static_cast<int32_t>(mix32(key + static_cast<uint32_t>(iq)) & 0xffu) - 128;
+                        int8_t quant = static_cast<int8_t>(signed_value);
+                        if (iq == 0) {
+                            quant = -128;
+                        } else if (iq == 31) {
+                            quant = 127;
+                        }
+                        if (ib + 1 == blocks.size()) {
+                            quant = iq & 1u ? 127 : -128;
+                        }
+                        blocks[ib].qs[iq] = quant;
+                    }
+                }
+                ggml_backend_tensor_set(t, blocks.data(), 0, ggml_nbytes(t));
+                continue;
+            }
+
+            GGML_ASSERT(t->type == GGML_TYPE_F32);
+            std::vector<float> data(ggml_nelements(t));
+            for (size_t i = 0; i < data.size(); ++i) {
+                const uint64_t i64 = static_cast<uint64_t>(i);
+                const uint32_t value = mix32(
+                    (0x12345678u + static_cast<uint32_t>(i) * 0x27d4eb2du) ^
+                    static_cast<uint32_t>(i64 >> 32));
+                data[i] = (static_cast<int32_t>(value & 0xffffu) - 32768) / 32768.0f;
+            }
+            if (!data.empty()) {
+                data.front() = 0.5f;
+                data.back() = -0.75f;
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+        }
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -9643,6 +9721,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_Q4_0, GGML_TYPE_F32, 512, 1, 2560, {1, 1}, {1, 1}));
     // Gemma 4 E4B gate/up projection shape used by ggml-xdna.
     test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_Q4_0, GGML_TYPE_F32, 10240, 1, 2560, {1, 1}, {1, 1}));
+    // Qwen 3.5 4B gate/up projection shape used by ggml-xdna.
+    test_cases.emplace_back(new test_mul_mat_weight_q8_0_deterministic(GGML_TYPE_Q8_0, GGML_TYPE_F32, 9216, 1, 2560, {1, 1}, {1, 1}));
 
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
     for (int64_t n : {1, 7, 8, 9, 16, 128, 512}) {
@@ -10859,6 +10939,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_BF16, GGML_TYPE_F32, 288, 1, 288, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_Q4_0, GGML_TYPE_F32, 512, 1, 2560, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_Q4_0, GGML_TYPE_F32, 10240, 1, 2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_weight_q8_0_deterministic(GGML_TYPE_Q8_0, GGML_TYPE_F32, 9216, 1, 2560, {1, 1}, {1, 1}));
 
     // FWHT tests
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1, 128));

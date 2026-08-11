@@ -24,6 +24,7 @@ enum class data_type {
     f32,
     bf16,
     q4_0,
+    q8_0,
 };
 
 enum class tensor_layout {

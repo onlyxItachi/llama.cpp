@@ -12,6 +12,8 @@ namespace {
 
 constexpr size_t ggml_q4_0_block_values = 32;
 constexpr size_t ggml_q4_0_block_bytes = 18;
+constexpr size_t ggml_q8_0_block_values = 32;
+constexpr size_t ggml_q8_0_block_bytes = 34;
 
 constexpr xdna_kernel_variant variants[] = {
     {
@@ -138,6 +140,37 @@ constexpr xdna_kernel_variant variants[] = {
         /* .worker_count            = */ 32,
         /* .prefer_for_offload      = */ false,
     },
+    {
+        /* .id                      = */ "aie2p-q8_0-gemv-m9216-n1-k2560",
+        /* .description             = */ "AIE2P Q8_0xF32 decode GEMV M=9216 N=1 K=2560",
+        /* .environment_variable    = */ "GGML_XDNA_AIE2P_Q8_0_GEMV_M9216_K2560_BUNDLE",
+        /* .xrt_kernel_name         = */ "MLIR_AIE",
+        /* .architecture            = */ device_architecture::aie2p,
+        /* .op                      = */ operation::mul_mat,
+        /* .weights_type            = */ data_type::q8_0,
+        /* .activation_type         = */ data_type::f32,
+        /* .output_type             = */ data_type::f32,
+        /* .device_activation_type  = */ data_type::bf16,
+        /* .device_output_type      = */ data_type::f32,
+        /* .m                       = */ 9216,
+        /* .n                       = */ 1,
+        /* .k                       = */ 2560,
+        /* .weights_batch           = */ { 1, 1 },
+        /* .activation_batch        = */ { 1, 1 },
+        /* .output_batch            = */ { 1, 1 },
+        /* .weights_layout          = */ tensor_layout::contiguous,
+        /* .activation_layout       = */ tensor_layout::contiguous,
+        /* .output_layout           = */ tensor_layout::contiguous,
+        /* .artifact_kind           = */ 3,
+        /* .artifact_abi_version    = */ 1,
+        /* .runtime_opcode          = */ 3,
+        /* .weight_bytes            = */ 9216 * (2560 / ggml_q8_0_block_values) * ggml_q8_0_block_bytes,
+        /* .device_activation_bytes = */ 2560 * sizeof(uint16_t),
+        /* .device_output_bytes     = */ 9216 * sizeof(float),
+        /* .rows_per_worker         = */ 16,
+        /* .worker_count            = */ 32,
+        /* .prefer_for_offload      = */ false,
+    },
 };
 
 data_type translate_type(enum ggml_type type) {
@@ -148,6 +181,8 @@ data_type translate_type(enum ggml_type type) {
             return data_type::bf16;
         case GGML_TYPE_Q4_0:
             return data_type::q4_0;
+        case GGML_TYPE_Q8_0:
+            return data_type::q8_0;
         default:
             return data_type::unknown;
     }
@@ -179,6 +214,8 @@ const char * data_type_name(data_type type) noexcept {
             return "BF16";
         case data_type::q4_0:
             return "Q4_0";
+        case data_type::q8_0:
+            return "Q8_0";
         case data_type::unknown:
             return "unknown";
     }

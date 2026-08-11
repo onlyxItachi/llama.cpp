@@ -30,18 +30,24 @@ Q4_M10240_K2560_OBJECT := gemv-q4_0-m10240-k2560.o
 Q4_M10240_K2560_XCLBIN := gemv-q4_0-m10240-k2560.xclbin
 Q4_M10240_K2560_INSTRUCTIONS := gemv-q4_0-m10240-k2560.insts.bin
 Q4_M10240_K2560_BUNDLE := gemv-q4_0-m10240-k2560.ggmlxdna
+Q8_M9216_K2560_PROGRAM := gemv-q8_0-m9216-k2560.mlir
+Q8_M9216_K2560_OBJECT := gemv-q8_0-m9216-k2560.o
+Q8_M9216_K2560_XCLBIN := gemv-q8_0-m9216-k2560.xclbin
+Q8_M9216_K2560_INSTRUCTIONS := gemv-q8_0-m9216-k2560.insts.bin
+Q8_M9216_K2560_BUNDLE := gemv-q8_0-m9216-k2560.ggmlxdna
 
 .PHONY: all check-environment clean
 .DELETE_ON_ERROR:
 
-all: $(Q4_BUNDLE) $(Q4_E4B_KV_BUNDLE) $(Q4_M10240_K2560_BUNDLE) $(BF16_BUNDLE)
+all: $(Q4_BUNDLE) $(Q4_E4B_KV_BUNDLE) $(Q4_M10240_K2560_BUNDLE) $(Q8_M9216_K2560_BUNDLE) $(BF16_BUNDLE)
 
 clean:
 	$(RM) $(BF16_PROGRAM) $(BF16_OBJECT) $(BF16_XCLBIN) $(BF16_INSTRUCTIONS) $(BF16_BUNDLE)
 	$(RM) $(Q4_PROGRAM) $(Q4_OBJECT) $(Q4_XCLBIN) $(Q4_INSTRUCTIONS) $(Q4_BUNDLE)
 	$(RM) $(Q4_E4B_KV_PROGRAM) $(Q4_E4B_KV_OBJECT) $(Q4_E4B_KV_XCLBIN) $(Q4_E4B_KV_INSTRUCTIONS) $(Q4_E4B_KV_BUNDLE)
 	$(RM) $(Q4_M10240_K2560_PROGRAM) $(Q4_M10240_K2560_OBJECT) $(Q4_M10240_K2560_XCLBIN) $(Q4_M10240_K2560_INSTRUCTIONS) $(Q4_M10240_K2560_BUNDLE)
-	$(RM) -r gemv-bf16-288.mlir.prj gemv-q4_0-288.mlir.prj gemv-q4_0-m512-k2560.mlir.prj gemv-q4_0-m10240-k2560.mlir.prj
+	$(RM) $(Q8_M9216_K2560_PROGRAM) $(Q8_M9216_K2560_OBJECT) $(Q8_M9216_K2560_XCLBIN) $(Q8_M9216_K2560_INSTRUCTIONS) $(Q8_M9216_K2560_BUNDLE)
+	$(RM) -r gemv-bf16-288.mlir.prj gemv-q4_0-288.mlir.prj gemv-q4_0-m512-k2560.mlir.prj gemv-q4_0-m10240-k2560.mlir.prj gemv-q8_0-m9216-k2560.mlir.prj
 
 check-environment:
 	@test -x "$(PYTHON)" || { echo "set IRON_ENV to an MLIR-AIE IRON environment" >&2; exit 1; }
@@ -131,3 +137,24 @@ $(Q4_M10240_K2560_BUNDLE): pack-artifact.py $(Q4_M10240_K2560_XCLBIN) $(Q4_M1024
 		--weight-bytes 14745600 --activation-bytes 5120 --output-bytes 40960 \
 		--xclbin $(Q4_M10240_K2560_XCLBIN) \
 		--instructions $(Q4_M10240_K2560_INSTRUCTIONS) --output $@
+
+$(Q8_M9216_K2560_OBJECT): gemv-q8_0-m9216-k2560.cpp | check-environment
+	$(PEANO_CLANGXX) -O2 -std=c++20 --target=aie2p-none-unknown-elf -DNDEBUG \
+		-D__AIE_API_AIE_ADF_HPP__ -I"$(AIE_API_INCLUDE)" -c $< -o $@
+
+$(Q8_M9216_K2560_PROGRAM): gemv-q8_0-m9216-k2560.py | check-environment
+	$(PYTHON) $< > $@
+
+$(Q8_M9216_K2560_XCLBIN) $(Q8_M9216_K2560_INSTRUCTIONS) &: $(Q8_M9216_K2560_PROGRAM) $(Q8_M9216_K2560_OBJECT) | check-environment
+	PATH="$(MLIR_AIE)/bin:$$PATH" $(AIECC) \
+		--alloc-scheme=basic-sequential \
+		--aie-generate-xclbin --no-compile-host --xclbin-name=$(Q8_M9216_K2560_XCLBIN) \
+		--no-xchesscc --no-xbridge --peano "$(PEANO)" \
+		--aie-generate-npu-insts --npu-insts-name=$(Q8_M9216_K2560_INSTRUCTIONS) $<
+	@test -s "$(Q8_M9216_K2560_XCLBIN)" && test -s "$(Q8_M9216_K2560_INSTRUCTIONS)"
+
+$(Q8_M9216_K2560_BUNDLE): pack-artifact.py $(Q8_M9216_K2560_XCLBIN) $(Q8_M9216_K2560_INSTRUCTIONS) | check-environment
+	$(PYTHON) $< --kind-id 3 --m 9216 --k 2560 \
+		--weight-bytes 25067520 --activation-bytes 5120 --output-bytes 36864 \
+		--xclbin $(Q8_M9216_K2560_XCLBIN) \
+		--instructions $(Q8_M9216_K2560_INSTRUCTIONS) --output $@
