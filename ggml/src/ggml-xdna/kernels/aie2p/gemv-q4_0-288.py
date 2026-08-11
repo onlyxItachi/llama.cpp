@@ -35,18 +35,16 @@ def build_program():
     activation_tile_type = np.ndarray[(columns,), bf16_type]
     output_tile_type = np.ndarray[(rows_per_tile,), f32_type]
 
-    zero = Kernel("zero_scalar_f32", "gemv-q4_0-288.o", [output_tile_type])
     gemv = Kernel(
         "gemv_q4_0_bf16_f32",
         "gemv-q4_0-288.o",
         [weight_tile_type, activation_tile_type, output_tile_type],
     )
 
-    def core_fn(weight_fifo, activation_fifo, output_fifo, zero_kernel, gemv_kernel):
+    def core_fn(weight_fifo, activation_fifo, output_fifo, gemv_kernel):
         output = output_fifo.acquire(1)
         weights = weight_fifo.acquire(1)
         activation = activation_fifo.acquire(1)
-        zero_kernel(output)
         gemv_kernel(weights, activation, output)
         weight_fifo.release(1)
         activation_fifo.release(1)
@@ -60,8 +58,9 @@ def build_program():
     output_fifo = ObjectFifo(output_tile_type, depth=1, name="output_f32")
     worker = Worker(
         core_fn,
-        [compute_weight_fifo.cons(), activation_fifo.cons(), output_fifo.prod(), zero, gemv],
-        # Scalar FP32 helper calls need more than IRON's default 1 KiB stack.
+        [compute_weight_fifo.cons(), activation_fifo.cons(), output_fifo.prod(), gemv],
+        # Vector state and exact fp16-scale conversion need more than IRON's
+        # default 1 KiB stack.
         stack_size=0x1000,
     )
 

@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: MIT
 
-// Scalar bring-up kernel for native GGML block_q4_0 bytes. This validates the
-// compressed hardware path; a production kernel must vectorize the unpack and
-// distribute output rows over more AIE tiles.
+// Single-worker vector kernel for native GGML block_q4_0 bytes. Multi-tile row
+// distribution is deliberately kept in the IRON design rather than this
+// shape-specific compute primitive.
 
+#include <aie_api/aie.hpp>
 #include <stdint.h>
 
 namespace {
 
-float fp16_to_fp32(uint16_t value) {
+__aie_inline float fp16_to_fp32(uint16_t value) {
     const uint32_t sign = static_cast<uint32_t>(value & 0x8000u) << 16u;
     uint32_t exponent = (value >> 10u) & 0x1fu;
     uint32_t mantissa = value & 0x03ffu;
@@ -39,38 +40,58 @@ float fp16_to_fp32(uint16_t value) {
     return result;
 }
 
+__aie_inline aie::vector<int8, 32> unpack_q4_0(const uint8_t * packed, bool safe_tail) {
+    // The pointer is two-byte aligned inside an 18-byte block.  This load
+    // consumes 16 packed bytes while allowing that alignment. Peano may issue
+    // wider surrounding loads, so the very last block uses an exact byte load
+    // to avoid reading past the object-FIFO allocation.
+    aie::vector<uint4, 32> q4;
+    if (safe_tail) {
+        alignas(32) uint8_t scratch[32] = {};
+        const volatile uint8_t * exact = packed;
+        for (unsigned int i = 0; i < 16; ++i) {
+            scratch[i] = exact[i];
+        }
+        q4 = aie::load_v<32>(reinterpret_cast<const uint4 *>(scratch));
+    } else {
+        q4 = aie::load_unaligned_v<32>(reinterpret_cast<const uint4 *>(packed), 4);
+    }
+    const auto q8_interleaved = q4.template unpack_sign<int8>(false);
+
+    // uint4 unpack produces [low0, high0, low1, high1, ...]. GGML's logical
+    // block order is low[0..15], high[0..15], so restore that order and keep
+    // the existing natural activation layout unchanged.
+    const auto q8_natural = aie::concat(
+        aie::filter_even(q8_interleaved, 1),
+        aie::filter_odd(q8_interleaved, 1));
+    return aie::sub(q8_natural, int8_t(8));
+}
+
+__aie_inline float dot_row(const uint8_t * weights, const bfloat16 * activation, bool final_row) {
+    float sum = 0.0f;
+    for (int block_index = 0; block_index < 9; ++block_index) {
+        const uint8_t * block = weights + block_index * 18;
+        const auto q_bf16 = aie::to_float<bfloat16>(
+            unpack_q4_0(block + 2, final_row && block_index == 8));
+        const auto x = aie::load_v<32>(activation + block_index * 32);
+        const float dot = aie::reduce_add<float>(aie::mul(q_bf16, x));
+
+        const uint16_t scale_bits = static_cast<uint16_t>(block[0]) |
+                                    (static_cast<uint16_t>(block[1]) << 8u);
+        sum += fp16_to_fp32(scale_bits) * dot;
+    }
+    return sum;
+}
+
 } // namespace
 
 extern "C" {
-
-void zero_scalar_f32(float * output) {
-    for (int row = 0; row < 32; ++row) {
-        output[row] = 0.0f;
-    }
-}
 
 // Each input object contains 32 complete GGML rows. A row holds nine
 // block_q4_0 values; each block is an LE fp16 scale plus 16 packed bytes.
 void gemv_q4_0_bf16_f32(const uint8_t * weights, const bfloat16 * activation, float * output) {
     for (int row = 0; row < 32; ++row) {
-        float sum = 0.0f;
-        for (int block_index = 0; block_index < 9; ++block_index) {
-            const uint8_t * block = weights + row * 162 + block_index * 18;
-            const uint16_t scale_bits = static_cast<uint16_t>(block[0]) |
-                                        (static_cast<uint16_t>(block[1]) << 8u);
-            const float scale = fp16_to_fp32(scale_bits);
-            const int activation_base = block_index * 32;
-            for (int j = 0; j < 16; ++j) {
-                const uint8_t packed = block[2 + j];
-                const int low = static_cast<int>(packed & 0x0fu) - 8;
-                const int high = static_cast<int>(packed >> 4u) - 8;
-                sum += scale * static_cast<float>(low) *
-                       static_cast<float>(activation[activation_base + j]);
-                sum += scale * static_cast<float>(high) *
-                       static_cast<float>(activation[activation_base + j + 16]);
-            }
-        }
-        output[row] += sum;
+        output[row] = dot_row(weights + row * 162, activation, row == 31);
     }
 }
 

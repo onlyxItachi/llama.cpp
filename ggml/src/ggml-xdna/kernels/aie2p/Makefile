@@ -7,6 +7,7 @@ MLIR_AIE ?= $(SITE_PACKAGES)/mlir_aie
 PEANO ?= $(SITE_PACKAGES)/llvm-aie
 AIECC ?= $(MLIR_AIE)/bin/aiecc
 PEANO_CLANGXX ?= $(PEANO)/bin/clang++
+AIE_API_INCLUDE ?= $(MLIR_AIE)/include
 XCLBINUTIL ?= xclbinutil
 
 BF16_PROGRAM := gemv-bf16-288.mlir
@@ -55,7 +56,8 @@ $(BF16_BUNDLE): pack-artifact.py $(BF16_XCLBIN) $(BF16_INSTRUCTIONS) | check-env
 		--instructions $(BF16_INSTRUCTIONS) --output $@
 
 $(Q4_OBJECT): gemv-q4_0-288.cpp | check-environment
-	$(PEANO_CLANGXX) -O2 -std=c++20 --target=aie2p-none-unknown-elf -DNDEBUG -c $< -o $@
+	$(PEANO_CLANGXX) -O2 -std=c++20 --target=aie2p-none-unknown-elf -DNDEBUG \
+		-D__AIE_API_AIE_ADF_HPP__ -I"$(AIE_API_INCLUDE)" -c $< -o $@
 
 $(Q4_PROGRAM): gemv-q4_0-288.py | check-environment
 	$(PYTHON) $< > $@
