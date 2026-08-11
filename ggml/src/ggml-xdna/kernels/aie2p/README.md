@@ -4,7 +4,9 @@ This directory contains MIT-licensed kernels and artifact tooling written
 for this experiment, plus Apache-2.0-with-LLVM-exception IRON generators adapted
 from Xilinx/mlir-aie. The meaningful path directly consumes native GGML
 `Q4_0[288,288] x F32[288,1]`; the BF16 version is retained as a simpler plumbing
-reference. The host converts only the small activation to BF16, while weights
+reference. The first production-shape specialization covers the Gemma 4 E4B
+sliding-window K/V projection `Q4_0[2560,512] x F32[2560,1]`. The host converts
+only the small activation to BF16, while weights
 remain in their registered GGML host allocation. The Q4_0 compute kernel uses
 AIE2P packed-nibble vector unpack, int8-to-BF16 conversion, vector multiply and
 vector reduction. The optimized Q4_0 artifact distributes the nine 32-row
@@ -18,6 +20,16 @@ source /opt/xilinx/xrt/setup.sh
 make IRON_ENV=/path/to/ironenv
 export GGML_XDNA_AIE2P_Q4_0_GEMV_BUNDLE="$PWD/gemv-q4_0-288.ggmlxdna"
 ```
+
+For the E4B K/V projection artifact, configure only its registered bundle:
+
+```sh
+export GGML_XDNA_AIE2P_Q4_0_GEMV_M512_K2560_BUNDLE="$PWD/gemv-q4_0-m512-k2560.ggmlxdna"
+```
+
+The current runtime loads one configured full-array artifact. Unset the other
+bundle variables when selecting a production shape; multi-design artifact
+loading remains a separate runtime milestone.
 
 To select the BF16 reference instead, set
 `GGML_XDNA_AIE2P_BF16_GEMV_BUNDLE`. Q4_0 takes priority if both bundles are
@@ -60,3 +72,9 @@ toolchain's five-input/five-output memory-tile DMA-channel limit. Every FIFO
 remains depth one, so the known depth-two forwarding corruption is not
 reintroduced. Further work should measure dispatch and DMA bounds and add a
 separate, validated pipelined artifact rather than mutating this topology.
+
+The E4B K/V design uses all 32 compute tiles as eight four-worker groups. Each
+worker receives 16 contiguous rows (23,040 bytes) and the activation is
+broadcast once. The core DMA descriptor length is measured in 32-bit address
+granules on AIE2P, so that payload occupies 5,760 of the available 16,383
+granules. Weights stay in native row-major GGML Q4_0 layout.

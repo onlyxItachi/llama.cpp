@@ -20,16 +20,22 @@ Q4_OBJECT := gemv-q4_0-288.o
 Q4_XCLBIN := gemv-q4_0-288.xclbin
 Q4_INSTRUCTIONS := gemv-q4_0-288.insts.bin
 Q4_BUNDLE := gemv-q4_0-288.ggmlxdna
+Q4_E4B_KV_PROGRAM := gemv-q4_0-m512-k2560.mlir
+Q4_E4B_KV_OBJECT := gemv-q4_0-m512-k2560.o
+Q4_E4B_KV_XCLBIN := gemv-q4_0-m512-k2560.xclbin
+Q4_E4B_KV_INSTRUCTIONS := gemv-q4_0-m512-k2560.insts.bin
+Q4_E4B_KV_BUNDLE := gemv-q4_0-m512-k2560.ggmlxdna
 
 .PHONY: all check-environment clean
 .DELETE_ON_ERROR:
 
-all: $(Q4_BUNDLE) $(BF16_BUNDLE)
+all: $(Q4_BUNDLE) $(Q4_E4B_KV_BUNDLE) $(BF16_BUNDLE)
 
 clean:
 	$(RM) $(BF16_PROGRAM) $(BF16_OBJECT) $(BF16_XCLBIN) $(BF16_INSTRUCTIONS) $(BF16_BUNDLE)
 	$(RM) $(Q4_PROGRAM) $(Q4_OBJECT) $(Q4_XCLBIN) $(Q4_INSTRUCTIONS) $(Q4_BUNDLE)
-	$(RM) -r gemv-bf16-288.mlir.prj gemv-q4_0-288.mlir.prj
+	$(RM) $(Q4_E4B_KV_PROGRAM) $(Q4_E4B_KV_OBJECT) $(Q4_E4B_KV_XCLBIN) $(Q4_E4B_KV_INSTRUCTIONS) $(Q4_E4B_KV_BUNDLE)
+	$(RM) -r gemv-bf16-288.mlir.prj gemv-q4_0-288.mlir.prj gemv-q4_0-m512-k2560.mlir.prj
 
 check-environment:
 	@test -x "$(PYTHON)" || { echo "set IRON_ENV to an MLIR-AIE IRON environment" >&2; exit 1; }
@@ -77,3 +83,24 @@ $(Q4_BUNDLE): pack-artifact.py $(Q4_XCLBIN) $(Q4_INSTRUCTIONS) | check-environme
 		--weight-bytes 46656 --activation-bytes 576 --output-bytes 1152 \
 		--xclbin $(Q4_XCLBIN) \
 		--instructions $(Q4_INSTRUCTIONS) --output $@
+
+$(Q4_E4B_KV_OBJECT): gemv-q4_0-m512-k2560.cpp | check-environment
+	$(PEANO_CLANGXX) -O2 -std=c++20 --target=aie2p-none-unknown-elf -DNDEBUG \
+		-D__AIE_API_AIE_ADF_HPP__ -I"$(AIE_API_INCLUDE)" -c $< -o $@
+
+$(Q4_E4B_KV_PROGRAM): gemv-q4_0-m512-k2560.py | check-environment
+	$(PYTHON) $< > $@
+
+$(Q4_E4B_KV_XCLBIN) $(Q4_E4B_KV_INSTRUCTIONS) &: $(Q4_E4B_KV_PROGRAM) $(Q4_E4B_KV_OBJECT) | check-environment
+	PATH="$(MLIR_AIE)/bin:$$PATH" $(AIECC) \
+		--alloc-scheme=basic-sequential \
+		--aie-generate-xclbin --no-compile-host --xclbin-name=$(Q4_E4B_KV_XCLBIN) \
+		--no-xchesscc --no-xbridge --peano "$(PEANO)" \
+		--aie-generate-npu-insts --npu-insts-name=$(Q4_E4B_KV_INSTRUCTIONS) $<
+	@test -s "$(Q4_E4B_KV_XCLBIN)" && test -s "$(Q4_E4B_KV_INSTRUCTIONS)"
+
+$(Q4_E4B_KV_BUNDLE): pack-artifact.py $(Q4_E4B_KV_XCLBIN) $(Q4_E4B_KV_INSTRUCTIONS) | check-environment
+	$(PYTHON) $< --kind-id 2 --m 512 --k 2560 \
+		--weight-bytes 737280 --activation-bytes 5120 --output-bytes 2048 \
+		--xclbin $(Q4_E4B_KV_XCLBIN) \
+		--instructions $(Q4_E4B_KV_INSTRUCTIONS) --output $@
