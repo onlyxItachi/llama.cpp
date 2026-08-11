@@ -207,8 +207,8 @@ extern "C" {
         // check if the backend can use tensors allocated in a buffer type
         bool (*supports_buft)(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft);
 
-        // (optional) check if the backend wants to run an operation, even if the weights are allocated in an incompatible buffer
-        // these should be expensive operations that may benefit from running on this backend instead of the CPU backend
+        // (optional) check if the backend wants to run an operation. The scheduler may use this to offload expensive
+        // CPU-backed operations or to prefer an ACCEL backend for a compatible shared host weight buffer
         bool (*offload_op)(ggml_backend_dev_t dev, const struct ggml_tensor * op);
 
         // (optional) event synchronization

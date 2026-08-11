@@ -891,12 +891,35 @@ static int ggml_backend_sched_backend_from_buffer(ggml_backend_sched_t sched, co
         return -1;
     }
 
-    // find highest prio backend that supports the buffer type and the op
+    const bool prefer_accel = sched->op_offload &&
+            op->op != GGML_OP_NONE && !ggml_is_view_op(op->op) &&
+            buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+            ggml_backend_buffer_is_host(buffer);
+    int first_supported = -1;
+
+    // An accelerator can explicitly request a compatible shared-buffer op.
+    // This is evaluated before ordinary backend priority so a decode-selective
+    // ACCEL can coexist with a GPU that owns the host buffer, while a rejected
+    // shape (for example prefill) naturally remains on the GPU.  Restrict the
+    // preference to ACCEL devices so existing multi-GPU ordering is unchanged.
     for (int i = 0; i < sched->n_backends; i++) {
         if (ggml_backend_supports_buft(sched->backends[i], buffer->buft) &&
             ggml_backend_supports_op(sched->backends[i], op)) {
-            return i;
+            if (!prefer_accel) {
+                return i;
+            }
+            if (first_supported == -1) {
+                first_supported = i;
+            }
+            if (ggml_backend_dev_type(ggml_backend_get_device(sched->backends[i])) == GGML_BACKEND_DEVICE_TYPE_ACCEL &&
+                    ggml_backend_offload_op(sched->backends[i], op)) {
+                return i;
+            }
         }
+    }
+
+    if (first_supported != -1) {
+        return first_supported;
     }
 
 #ifndef NDEBUG
@@ -1407,7 +1430,34 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     }
                 }
 
-                if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                const bool src_buffer_supported = ggml_backend_sched_buffer_supported(sched, src, cur_backend_id);
+                ggml_backend_buffer_t src_buffer = src->view_src ? src->view_src->buffer : src->buffer;
+                ggml_backend_buffer_type_t src_buft = src_buffer != NULL ?
+                        src_buffer->buft : sched->bufts[src_backend_id];
+                const enum ggml_backend_dev_type target_type = ggml_backend_dev_type(
+                        ggml_backend_get_device(sched->backends[cur_backend_id]));
+                const enum ggml_backend_dev_type source_type = ggml_backend_dev_type(
+                        ggml_backend_get_device(sched->backends[src_backend_id]));
+                const bool target_is_gpu = target_type == GGML_BACKEND_DEVICE_TYPE_GPU ||
+                        target_type == GGML_BACKEND_DEVICE_TYPE_IGPU;
+                const bool target_uses_device_memory = sched->bufts[cur_backend_id] != NULL &&
+                        !ggml_backend_buft_is_host(sched->bufts[cur_backend_id]);
+                const bool source_is_host_compute = source_type == GGML_BACKEND_DEVICE_TYPE_CPU ||
+                        source_type == GGML_BACKEND_DEVICE_TYPE_ACCEL;
+                const bool source_uses_host_memory = src_buft != NULL && ggml_backend_buft_is_host(src_buft);
+                const bool immutable_weight = src_buffer != NULL &&
+                        ggml_backend_buffer_get_usage(src_buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+
+                // A GPU may support its pinned-host buffer type for immutable
+                // model weights, but cross-backend transient values must be
+                // materialized in the GPU compute buffer.  In particular,
+                // GPU compute (including fused paths) can otherwise consume
+                // a CPU/ACCEL-produced host pointer as a device-local intermediate.
+                const bool materialize_gpu_input = src_buffer_supported && target_is_gpu &&
+                        target_uses_device_memory && source_is_host_compute &&
+                        source_uses_host_memory && !immutable_weight;
+                if (src_backend_id != cur_backend_id &&
+                        (!src_buffer_supported || materialize_gpu_input)) {
                     // create a copy of the input in the split's backend
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];
