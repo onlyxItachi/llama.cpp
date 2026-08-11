@@ -215,9 +215,10 @@ limited to immutable model/test weight buffers that must outlive their cached
 views. Scheduler output is not registered: each kernel state owns a persistent
 output BO sized for that variant and copies it back after synchronization, so
 context reserve/reallocation cannot leave a transient scheduler allocation
-pinned. Before supporting arbitrary immutable-buffer lifetimes, registration
-ownership and eviction must move into an XDNA buffer wrapper so an XRT BO can
-never outlive its GGML mapping.
+pinned. Before supporting arbitrary immutable-buffer lifetimes, GGML needs a
+cancelable buffer-free observer so XDNA can destroy child views and parent XRT
+BOs before the actual owner (including ROCm) releases the host allocation. An
+XDNA-owned wrapper alone cannot solve the shared `ROCm_Host` case.
 
 Page-window registration avoids pinning an unrelated full model allocation.
 Adjacent GGML weights can share a boundary page, so their rounded XRT parents
@@ -233,8 +234,9 @@ reported two hits and only the original sync; subsequent results had NMSE
 0.0481 and 0.189 instead of the first call's 9.55e-8. The current slice is thus
 safe only under the llama.cpp model/context ordering used here, where model
 weights remain alive until the XDNA context/backend is destroyed. It is not a
-general-purpose upstream-ready buffer cache. A custom XDNA host buffer with a
-free-time registration callback is the required fix before broadening use.
+general-purpose upstream-ready buffer cache. A cancelable, provider-independent
+GGML buffer-free observer is the required fix before broadening use; the XDNA
+runtime must unsubscribe if it is destroyed before the backing buffer.
 
 ## Implemented vertical slice
 
@@ -293,8 +295,9 @@ The configured variant accepts only its exact contract:
   `BF16[288,288]` plumbing reference;
 - one AIE2P/XDNA2 device and an explicitly configured versioned artifact bundle.
 
-The bundle couples a self-identifying kernel kind, ABI version, dimensions,
-weight/activation/output byte sizes, xclbin, and instruction stream. The runtime
+The bundle couples a self-identifying kernel kind, ABI version, M and K,
+weight/activation/output byte sizes, xclbin, and instruction stream; N=1 is
+enforced by the selected variant rather than encoded in ABI v1. The runtime
 parses and validates the complete bundle before `supports_op` becomes true. A
 deliberate test labeling the BF16 bundle as Q4_0 was rejected with an ABI
 metadata mismatch and zero submissions, preventing accidental cross-pairing of
