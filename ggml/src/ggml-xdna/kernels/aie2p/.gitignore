@@ -1,0 +1,8 @@
+/*.insts.bin
+/*.ggmlxdna
+/.gemv-*.ggmlxdna.*
+/*.mlir
+/*.mlir.prj/
+/*.o
+/*.xclbin
+/_build/

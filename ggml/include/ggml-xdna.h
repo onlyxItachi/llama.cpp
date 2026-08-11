@@ -9,17 +9,34 @@ extern "C" {
 #endif
 
 struct ggml_backend_xdna_stats {
-    uint64_t bo_creations;
+    uint64_t initialization_time_ns;
+    uint64_t explicit_bo_creations;
+    uint64_t explicit_bo_creation_bytes;
+    uint64_t buffer_registrations;
+    uint64_t buffer_registration_hits;
+    uint64_t registered_bytes;
+    uint64_t registration_time_ns;
     uint64_t weight_registrations;
     uint64_t weight_registration_hits;
+    uint64_t weight_registered_bytes;
+    uint64_t weight_sync_to_device_calls;
+    uint64_t weight_sync_to_device_bytes;
+    uint64_t weight_sync_to_device_time_ns;
     uint64_t sync_to_device_calls;
     uint64_t sync_from_device_calls;
     uint64_t sync_to_device_bytes;
     uint64_t sync_from_device_bytes;
+    uint64_t sync_to_device_time_ns;
+    uint64_t sync_from_device_time_ns;
     uint64_t host_copy_calls;
     uint64_t host_copy_bytes;
+    uint64_t host_copy_time_ns;
+    uint64_t weight_copy_bytes;
     uint64_t kernel_submissions;
+    uint64_t first_kernel_time_ns;
+    uint64_t first_compute_time_ns;
     uint64_t kernel_time_ns;
+    uint64_t total_compute_time_ns;
 };
 
 GGML_BACKEND_API ggml_backend_t ggml_backend_xdna_init(int device);

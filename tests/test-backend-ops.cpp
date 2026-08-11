@@ -4787,6 +4787,31 @@ static constexpr float H20[20][20] = {
 #undef P
 #undef N
 
+// GGML_XDNA's first decode kernels consume immutable host-backed model
+// weights. Keep the focused test shapes in a separate weight buffer so the
+// backend test exercises the same persistent-registration contract as model
+// execution instead of a short-lived compute allocation.
+struct test_mul_mat_weight : public test_mul_mat {
+    using test_mul_mat::test_mul_mat;
+    using test_mul_mat::build_graph;
+
+    bool use_weight_context() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        GGML_ASSERT(ctx_weights != nullptr);
+        GGML_ASSERT(per[0] == 0 && per[1] == 1 && per[2] == 2 && per[3] == 3);
+        GGML_ASSERT(k_v == 0 && o == 1);
+
+        ggml_tensor * a = ggml_new_tensor_4d(ctx_weights, type_a, k, m, bs[0], bs[1]);
+        ggml_tensor * b = ggml_new_tensor_4d(ctx, type_b, k, n, bs[0] * nr[0], bs[1] * nr[1]);
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -9609,6 +9634,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
+    // Fixed batch-1 shapes used by the initial ggml-xdna hardware kernels.
+    test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_Q4_0, GGML_TYPE_F32, 288, 1, 288, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_BF16, GGML_TYPE_F32, 288, 1, 288, {1, 1}, {1, 1}));
 
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
     for (int64_t n : {1, 7, 8, 9, 16, 128, 512}) {
@@ -10821,6 +10849,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 16416, 1, 128, {8,  1}, {4, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 1, 16416, {8,  1}, {4, 1}, {0, 1, 2, 3}, 2*16416));
+    test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_Q4_0, GGML_TYPE_F32, 288, 1, 288, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_BF16, GGML_TYPE_F32, 288, 1, 288, {1, 1}, {1, 1}));
 
     // FWHT tests
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1, 128));

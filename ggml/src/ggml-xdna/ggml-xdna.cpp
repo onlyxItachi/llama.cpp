@@ -6,6 +6,7 @@
 #include "ggml.h"
 #include "xdna-runtime.h"
 
+#include <cinttypes>
 #include <cstring>
 #include <exception>
 #include <memory>
@@ -17,12 +18,15 @@ namespace {
 
 struct xdna_device_context {
     ggml_xdna::device_info info;
+    ggml_xdna::kernel_configuration kernel_configuration;
     std::string name;
     std::string description;
 };
 
 struct xdna_backend_context {
-    explicit xdna_backend_context(const ggml_xdna::device_info & info) : runtime(info) {}
+    xdna_backend_context(
+            const ggml_xdna::device_info & info,
+            const ggml_xdna::kernel_configuration & configuration) : runtime(info, configuration) {}
 
     ggml_xdna::runtime runtime;
 };
@@ -37,7 +41,46 @@ static const char * ggml_backend_xdna_name(ggml_backend_t backend) {
 }
 
 static void ggml_backend_xdna_free(ggml_backend_t backend) {
-    delete static_cast<xdna_backend_context *>(backend->context);
+    auto * ctx = static_cast<xdna_backend_context *>(backend->context);
+    ggml_backend_xdna_stats stats = {};
+    ctx->runtime.get_stats(&stats);
+    GGML_LOG_INFO(
+            "ggml_xdna: init_ms=%.3f submissions=%" PRIu64 " first_kernel_ms=%.3f "
+            "first_total_ms=%.3f kernel_ms=%.3f total_ms=%.3f "
+            "root_registrations=%" PRIu64 " registration_hits=%" PRIu64 " registration_ms=%.3f "
+            "registered_MiB=%.3f explicit_payload_BOs=%" PRIu64 "/%" PRIu64 "B "
+            "weight_views=%" PRIu64 " weight_hits=%" PRIu64 " weight_sync=%" PRIu64 "/%" PRIu64 "B/%.3fms "
+            "weight_copy_bytes=%" PRIu64 " "
+            "sync_to=%" PRIu64 "/%" PRIu64 "B/%.3fms sync_from=%" PRIu64 "/%" PRIu64 "B/%.3fms "
+            "host_copies=%" PRIu64 "/%" PRIu64 "B/%.3fms\n",
+            stats.initialization_time_ns / 1.0e6,
+            stats.kernel_submissions,
+            stats.first_kernel_time_ns / 1.0e6,
+            stats.first_compute_time_ns / 1.0e6,
+            stats.kernel_time_ns / 1.0e6,
+            stats.total_compute_time_ns / 1.0e6,
+            stats.buffer_registrations,
+            stats.buffer_registration_hits,
+            stats.registration_time_ns / 1.0e6,
+            stats.registered_bytes / (1024.0 * 1024.0),
+            stats.explicit_bo_creations,
+            stats.explicit_bo_creation_bytes,
+            stats.weight_registrations,
+            stats.weight_registration_hits,
+            stats.weight_sync_to_device_calls,
+            stats.weight_sync_to_device_bytes,
+            stats.weight_sync_to_device_time_ns / 1.0e6,
+            stats.weight_copy_bytes,
+            stats.sync_to_device_calls,
+            stats.sync_to_device_bytes,
+            stats.sync_to_device_time_ns / 1.0e6,
+            stats.sync_from_device_calls,
+            stats.sync_from_device_bytes,
+            stats.sync_from_device_time_ns / 1.0e6,
+            stats.host_copy_calls,
+            stats.host_copy_bytes,
+            stats.host_copy_time_ns / 1.0e6);
+    delete ctx;
     delete backend;
 }
 
@@ -120,9 +163,12 @@ static void ggml_backend_xdna_device_get_props(ggml_backend_dev_t dev, ggml_back
     props->caps = {
         /* .async                = */ false,
         /* .host_buffer          = */ false,
-        /* .buffer_from_host_ptr = */ true,
+        /* .buffer_from_host_ptr = */ false,
         /* .events               = */ false,
-        /* .mmap_support         = */ true,
+        // The installed amdxdna driver must be able to pin PROT_READ mappings before
+        // host-pointer wrapping and mmap loading can be enabled. Writable CPU buffers
+        // are registered lazily by the compute runtime instead.
+        /* .mmap_support         = */ false,
     };
 }
 
@@ -131,10 +177,21 @@ static ggml_backend_t ggml_backend_xdna_device_init_backend(ggml_backend_dev_t d
 
     auto * dev_ctx = static_cast<xdna_device_context *>(dev->context);
     try {
-        auto * ctx = new xdna_backend_context(dev_ctx->info);
+        auto * ctx = new xdna_backend_context(dev_ctx->info, dev_ctx->kernel_configuration);
+        if (dev_ctx->kernel_configuration.available && !ctx->runtime.kernel_available()) {
+            GGML_LOG_ERROR("ggml_xdna: failed to load configured kernel on %s: %s\n",
+                    dev_ctx->info.name.c_str(), ctx->runtime.kernel_status().c_str());
+            delete ctx;
+            return nullptr;
+        }
         GGML_LOG_INFO("ggml_xdna: initialized %s at %s (%s); %s\n",
                 dev_ctx->info.name.c_str(), dev_ctx->info.bdf.c_str(), dev_ctx->info.architecture.c_str(),
                 ctx->runtime.kernel_status().c_str());
+        if (dev_ctx->kernel_configuration.available) {
+            GGML_LOG_WARN(
+                    "ggml_xdna: experimental lifetime contract: immutable GGML weight buffers must outlive "
+                    "this backend instance\n");
+        }
         return new ggml_backend {
             /* .guid    = */ ggml_backend_xdna_guid(),
             /* .iface   = */ ggml_backend_xdna_i,
@@ -153,14 +210,12 @@ static ggml_backend_buffer_type_t ggml_backend_xdna_device_get_buffer_type(ggml_
     return ggml_backend_cpu_buffer_type();
 }
 
-static ggml_backend_buffer_t ggml_backend_xdna_device_buffer_from_host_ptr(
-        ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size) {
-    GGML_UNUSED(dev);
-    GGML_UNUSED(max_tensor_size);
-    return ggml_backend_cpu_buffer_from_ptr(ptr, size);
-}
-
 static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    auto * dev_ctx = static_cast<xdna_device_context *>(dev->context);
+    if (!dev_ctx->kernel_configuration.available) {
+        return false;
+    }
+
     switch (op->op) {
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
@@ -172,15 +227,12 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const g
             break;
     }
 
-    // Keep hardware execution fail-closed until a matching kernel contract is loaded.
-    // In particular, capability queries must not repeatedly open the XRT device.
-    GGML_UNUSED(dev);
-    return false;
+    return ggml_xdna::supports_op_contract(op, dev_ctx->kernel_configuration.kind);
 }
 
 static bool ggml_backend_xdna_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     GGML_UNUSED(dev);
-    return ggml_backend_buft_is_host(buft);
+    return buft == ggml_backend_cpu_buffer_type();
 }
 
 static const ggml_backend_device_i ggml_backend_xdna_device_i = {
@@ -192,7 +244,7 @@ static const ggml_backend_device_i ggml_backend_xdna_device_i = {
     /* .init_backend         = */ ggml_backend_xdna_device_init_backend,
     /* .get_buffer_type      = */ ggml_backend_xdna_device_get_buffer_type,
     /* .get_host_buffer_type = */ nullptr,
-    /* .buffer_from_host_ptr = */ ggml_backend_xdna_device_buffer_from_host_ptr,
+    /* .buffer_from_host_ptr = */ nullptr,
     /* .supports_op          = */ ggml_backend_xdna_device_supports_op,
     /* .supports_buft        = */ ggml_backend_xdna_device_supports_buft,
     /* .offload_op           = */ nullptr,
@@ -215,6 +267,7 @@ struct xdna_registry_context {
             auto & info = found[ordinal];
             auto ctx = std::make_unique<xdna_device_context>();
             ctx->info = std::move(info);
+            ctx->kernel_configuration = ggml_xdna::probe_kernel_configuration(ctx->info);
             ctx->name = "XDNA" + std::to_string(ordinal);
             ctx->description = ctx->info.name + " (" + ctx->info.architecture + ")";
             devices.push_back({

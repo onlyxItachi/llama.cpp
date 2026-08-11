@@ -92,6 +92,11 @@ if (NOT GGML_SHARED_LIB)
         set(GGML_HIP_INTERFACE_LINK_LIBRARIES hip::host roc::rocblas roc::hipblas)
     endif()
 
+    if (GGML_XDNA)
+        find_dependency(XRT CONFIG HINTS "${GGML_XDNA_XRT_ROOT}/share/cmake/XRT")
+        set(GGML_XDNA_INTERFACE_LINK_LIBRARIES XRT::xrt_coreutil)
+    endif()
+
     if (GGML_SYCL)
         set(GGML_SYCL_INTERFACE_LINK_LIBRARIES "")
         find_package(DNNL)

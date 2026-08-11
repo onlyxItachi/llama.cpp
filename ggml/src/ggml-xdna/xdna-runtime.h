@@ -19,11 +19,28 @@ struct device_info {
     std::string architecture;
 };
 
+enum class kernel_kind {
+    none,
+    bf16_gemv_288,
+    q4_0_gemv_288,
+};
+
+struct kernel_configuration {
+    bool available = false;
+    kernel_kind kind = kernel_kind::none;
+    std::string artifact_path;
+    std::vector<char> xclbin_data;
+    std::vector<uint32_t> instructions;
+    std::string status;
+};
+
 std::vector<device_info> discover_devices(std::string * error = nullptr) noexcept;
+kernel_configuration probe_kernel_configuration(const device_info & info) noexcept;
+bool supports_op_contract(const ggml_tensor * op, kernel_kind kind) noexcept;
 
 class runtime {
 public:
-    explicit runtime(const device_info & info);
+    runtime(const device_info & info, const kernel_configuration & configuration);
     ~runtime();
 
     runtime(const runtime &) = delete;
