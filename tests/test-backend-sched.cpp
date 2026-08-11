@@ -502,6 +502,56 @@ static void test_accel_offload_preference(
     ggml_backend_buffer_free(weight_buffer);
 }
 
+static void test_accel_only_fallback(bool scheduler_allows_offload, bool accel_requests_offload) {
+    ggml_backend_buffer_type host_buft = make_mock_buffer_type(true);
+
+    mock_backend_storage cpu_backend("MockCPU", GGML_BACKEND_DEVICE_TYPE_CPU, &host_buft, &host_buft);
+    host_buft.device = &cpu_backend.device;
+    mock_backend_storage accel_backend(
+            "MockACCEL",
+            GGML_BACKEND_DEVICE_TYPE_ACCEL,
+            &host_buft,
+            &host_buft,
+            accel_requests_offload);
+
+    ggml_backend_t backends[] = { &accel_backend.backend, &cpu_backend.backend };
+    ggml_backend_buffer_type_t bufts[] = { &host_buft, &host_buft };
+    ggml_backend_sched_t sched =
+            ggml_backend_sched_new(backends, bufts, 2, 16, false, scheduler_allows_offload);
+
+    ggml_init_params params = {
+        /* .mem_size   = */ 4 * ggml_tensor_overhead() + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context_ptr ctx = ggml_context_ptr(ggml_init(params));
+    require(ctx != nullptr, "failed to create ACCEL-only graph context");
+
+    ggml_tensor * weight = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 32);
+    ggml_set_name(weight, "weight");
+    ggml_backend_buffer_t weight_buffer =
+            ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), &host_buft);
+    require(weight_buffer != nullptr, "failed to allocate ACCEL-only weight buffer");
+    ggml_backend_buffer_set_usage(weight_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    ggml_tensor * consumer = ggml_sqr(ctx.get(), weight);
+    ggml_set_name(consumer, "offload_candidate");
+    ggml_cgraph * graph = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(graph, consumer);
+    ggml_backend_sched_split_graph(sched, graph);
+
+    require(
+            ggml_backend_sched_get_tensor_backend(sched, weight) == &accel_backend.backend,
+            "ACCEL-only weight did not select the capable ACCEL backend");
+    require(
+            ggml_backend_sched_get_tensor_backend(sched, consumer) == &accel_backend.backend,
+            "ACCEL-only operation required an offload preference request");
+    require(consumer->src[0] == weight, "ACCEL-only shared weight was copied");
+
+    ggml_backend_sched_free(sched);
+    ggml_backend_buffer_free(weight_buffer);
+}
+
 int main() {
     test_buffer_free_observers();
     test_cpu_mapped_buffer_type_identity();
@@ -547,6 +597,9 @@ int main() {
             memory_kind::host,
             memory_kind::host,
             tensor_kind::compute);
+    test_accel_only_fallback(true, false);
+    test_accel_only_fallback(false, false);
+    test_accel_only_fallback(true, true);
 
     return 0;
 }

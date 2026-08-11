@@ -43,6 +43,7 @@ constexpr xdna_kernel_variant variants[] = {
         /* .device_output_bytes     = */ 288 * sizeof(float),
         /* .rows_per_worker         = */ 32,
         /* .worker_count            = */ 9,
+        /* .prefer_for_offload      = */ false,
     },
     {
         /* .id                      = */ "aie2p-bf16-gemv-m288-n1-k288",
@@ -73,6 +74,7 @@ constexpr xdna_kernel_variant variants[] = {
         /* .device_output_bytes     = */ 288 * sizeof(float),
         /* .rows_per_worker         = */ 32,
         /* .worker_count            = */ 1,
+        /* .prefer_for_offload      = */ false,
     },
     {
         /* .id                      = */ "aie2p-q4_0-gemv-m512-n1-k2560",
@@ -103,6 +105,7 @@ constexpr xdna_kernel_variant variants[] = {
         /* .device_output_bytes     = */ 512 * sizeof(float),
         /* .rows_per_worker         = */ 16,
         /* .worker_count            = */ 32,
+        /* .prefer_for_offload      = */ false,
     },
     {
         /* .id                      = */ "aie2p-q4_0-gemv-m10240-n1-k2560",
@@ -133,6 +136,7 @@ constexpr xdna_kernel_variant variants[] = {
         /* .device_output_bytes     = */ 10240 * sizeof(float),
         /* .rows_per_worker         = */ 16,
         /* .worker_count            = */ 32,
+        /* .prefer_for_offload      = */ false,
     },
 };
 
@@ -260,6 +264,12 @@ const xdna_kernel_variant * select_kernel_variant(
         }
     }
     return nullptr;
+}
+
+bool kernel_variant_prefers_offload(
+        const xdna_kernel_variant & variant,
+        bool force_preference) noexcept {
+    return force_preference || variant.prefer_for_offload;
 }
 
 } // namespace ggml_xdna

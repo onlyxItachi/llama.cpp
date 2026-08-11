@@ -92,6 +92,7 @@ struct xdna_kernel_variant {
     size_t device_output_bytes;
     uint32_t rows_per_worker;
     uint32_t worker_count;
+    bool prefer_for_offload;
 };
 
 const char * architecture_name(device_architecture architecture) noexcept;
@@ -112,5 +113,9 @@ const xdna_kernel_variant * select_kernel_variant(
         const xdna_problem & problem,
         const xdna_kernel_variant * const * candidates,
         size_t candidate_count) noexcept;
+
+bool kernel_variant_prefers_offload(
+        const xdna_kernel_variant & variant,
+        bool force_preference) noexcept;
 
 } // namespace ggml_xdna

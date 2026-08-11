@@ -50,6 +50,12 @@ persistent XRT state per artifact, and selects among them from the generic
 specializations in one backend instance. Registry order is used only when more
 than one variant matches the same problem.
 
+Configured variants remain available through `supports_op`, but the current
+measured variants do not request automatic scheduler priority over an earlier
+GPU. Set `GGML_XDNA_PREFER_OFFLOAD=1` only for an intentional heterogeneous
+experiment. Exact shape, buffer, and immutability gates still apply, and an
+XDNA-only configuration continues to select XDNA without the override.
+
 To make the BF16 reference available as well, set
 `GGML_XDNA_AIE2P_BF16_GEMV_BUNDLE`. The bundle header couples the declared
 kernel kind, fixed tensor ABI, xclbin, and instruction stream. It prevents

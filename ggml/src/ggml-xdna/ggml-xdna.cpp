@@ -7,6 +7,7 @@
 #include "xdna-runtime.h"
 
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <memory>
@@ -20,6 +21,7 @@ struct xdna_device_context {
     ggml_xdna::device_info info;
     ggml_xdna::readonly_userptr_capability readonly_userptr;
     ggml_xdna::kernel_configuration kernel_configuration;
+    bool force_offload_preference = false;
     std::string name;
     std::string description;
 };
@@ -279,9 +281,8 @@ static bool ggml_backend_xdna_device_supports_buft(ggml_backend_dev_t dev, ggml_
 }
 
 static bool ggml_backend_xdna_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
-    // Opt into scheduler preference only for an exact registered kernel.  This
-    // keeps large-batch prefill on HIP while allowing a shared host-backed
-    // batch-one decode weight to select XDNA.
+    // Capability and scheduler preference are separate. Only an exact,
+    // immutable-buffer kernel can request priority over an earlier backend.
     if (op == nullptr || op->src[0] == nullptr || op->src[0]->buffer == nullptr ||
             !ggml_backend_xdna_device_supports_buft(dev, op->src[0]->buffer->buft)) {
         return false;
@@ -289,9 +290,16 @@ static bool ggml_backend_xdna_device_offload_op(ggml_backend_dev_t dev, const gg
 
     ggml_xdna::xdna_problem problem;
     auto * dev_ctx = static_cast<xdna_device_context *>(dev->context);
-    return ggml_xdna::problem_from_ggml(op, dev_ctx->info.arch, &problem) &&
-           problem.weights_usage == ggml_xdna::weight_usage::immutable &&
-           ggml_xdna::select_kernel_configuration(dev_ctx->kernel_configuration, problem) != nullptr;
+    if (!ggml_xdna::problem_from_ggml(op, dev_ctx->info.arch, &problem) ||
+            problem.weights_usage != ggml_xdna::weight_usage::immutable) {
+        return false;
+    }
+
+    const auto * configuration =
+            ggml_xdna::select_kernel_configuration(dev_ctx->kernel_configuration, problem);
+    return configuration != nullptr && configuration->variant != nullptr &&
+           ggml_xdna::kernel_variant_prefers_offload(
+                   *configuration->variant, dev_ctx->force_offload_preference);
 }
 
 static const ggml_backend_device_i ggml_backend_xdna_device_i = {
@@ -326,6 +334,8 @@ struct xdna_registry_context {
             auto & info = found[ordinal];
             auto ctx = std::make_unique<xdna_device_context>();
             ctx->info = std::move(info);
+            const char * prefer_offload = std::getenv("GGML_XDNA_PREFER_OFFLOAD");
+            ctx->force_offload_preference = prefer_offload != nullptr && std::atoi(prefer_offload) != 0;
             ctx->kernel_configuration = ggml_xdna::probe_kernel_configuration(ctx->info);
             if (ctx->kernel_configuration.available) {
                 ctx->readonly_userptr = ggml_xdna::probe_readonly_userptr(ctx->info);
@@ -335,6 +345,10 @@ struct xdna_registry_context {
             }
             ctx->name = "XDNA" + std::to_string(ordinal);
             ctx->description = ctx->info.name + " (" + ctx->info.architecture + ")";
+            if (ctx->force_offload_preference) {
+                GGML_LOG_INFO("ggml_xdna: %s automatic offload preference forced by GGML_XDNA_PREFER_OFFLOAD\n",
+                        ctx->name.c_str());
+            }
             if (ctx->readonly_userptr.supported) {
                 GGML_LOG_INFO("ggml_xdna: %s read-only mmap registration enabled: %s\n",
                         ctx->name.c_str(), ctx->readonly_userptr.status.c_str());

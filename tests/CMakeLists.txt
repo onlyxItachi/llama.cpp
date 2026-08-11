@@ -371,6 +371,16 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     # Needs non-public ggml{,-backend}-impl.h
     llama_build_and_test(test-alloc.cpp)
     llama_build_and_test(test-backend-sched.cpp)
+    if (GGML_XDNA)
+        llama_build_and_test(
+            test-xdna-offload-policy.cpp
+            ${PROJECT_SOURCE_DIR}/ggml/src/ggml-xdna/xdna-kernel-registry.cpp
+        )
+        target_include_directories(test-xdna-offload-policy PRIVATE
+            ${PROJECT_SOURCE_DIR}/ggml/src
+            ${PROJECT_SOURCE_DIR}/ggml/src/ggml-xdna
+        )
+    endif()
 endif()
 
 llama_build(test-export-graph-ops.cpp)

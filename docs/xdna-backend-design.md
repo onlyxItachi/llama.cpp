@@ -96,9 +96,15 @@ otherwise CPU assignment
 weight already supported by HIP. The integrated scheduler adds a narrow generic
 preference: only an ACCEL's affirmative `offload_op` for an immutable
 host-backed weight can override ordinary owner priority. The XDNA callback then
-requires an exact registered kernel, so batch-one decode can select XDNA while
-unsupported prefill remains on HIP. This policy is capability-driven and does
-not add model-specific placement logic.
+requires an exact registered kernel and consults per-variant preference
+metadata. All current variants remain supported but default to no automatic
+preference because the measured HIP implementations are faster. Thus normal
+`[ROCm0, XDNA0, CPU]` order keeps a mutually supported operation on ROCm, while
+an XDNA-only configuration still selects XDNA as the first capable backend.
+Set `GGML_XDNA_PREFER_OFFLOAD=1` to request the exact XDNA kernels explicitly
+for controlled heterogeneous experiments; unsupported shapes such as prefill
+remain on HIP. This policy is capability-driven and does not add model-specific
+placement logic.
 
 ## Selected open stack and generation split
 
@@ -562,14 +568,17 @@ XDNA weight-copy bytes. Both engines matched CPU and the two XDNA outputs were
 bit-identical. This proves one shared system-memory weight allocation, not zero
 data movement.
 
-The integrated scheduler now lets an ACCEL backend's exact `offload_op` request
-override ordinary owner priority only for immutable host-backed weights. With
-normal production order `[ROCm0, XDNA0, CPU]`, three physical processes selected
-XDNA for `N=1` and ROCm for `N=32` from the same `ROCm_Host` pointer. XDNA
-admits that buffer through the generic owning-device/declared-host-buft
-relationship, without a `ROCm_Host` name check, while continuing to reject
-`CPU_Mapped`. The XDNA registration survived the intervening HIP execution and
-again reported zero weight-copy bytes.
+The integrated scheduler lets an ACCEL backend's exact `offload_op` request
+override ordinary owner priority only for immutable host-backed weights. Before
+the evidence-based XDNA preference gate, three physical processes using
+`[ROCm0, XDNA0, CPU]` selected XDNA for `N=1` and ROCm for `N=32` from the same
+`ROCm_Host` pointer. XDNA admits that buffer through the generic
+owning-device/declared-host-buft relationship, without a `ROCm_Host` name check,
+while continuing to reject `CPU_Mapped`. The XDNA registration survived the
+intervening HIP execution and again reported zero weight-copy bytes. Current
+default policy leaves mutually supported decode on the earlier ROCm backend;
+`GGML_XDNA_PREFER_OFFLOAD=1` intentionally restores the measured XDNA placement
+for mode-C experiments without widening XDNA capability.
 Large-model pinned-allocation failure remains an open productization gate; serialized immutable-buffer free-time eviction now passes the exact-address regression described above.
 
 The local `stories15M-q4_0.gguf` is a real 24.41-million-parameter, six-layer
@@ -696,7 +705,7 @@ AIE2 requires its own implementation and is not inferred from the tested AIE2P k
 | Reuse without per-token weight copy? | **GO for serialized immutable-buffer lifetimes**: persistent parent/view/run reuse has zero weight-copy bytes, and observer-driven eviction passes exact owner/base/data ABA reuse with two registrations and no hits. Mutable/test weights use one explicit native-byte staging copy per call. Concurrent compute/free/backend teardown is not claimed. |
 | Ordinary read-only GGUF mmap? | **NO on the installed driver, fail-closed automatically**: the complete file-backed `PROT_READ` parent/subview/sync probe fails with errno 12, leaving `mmap_support` and `CPU_Mapped` acceptance disabled. Upstream driver commit `ed8fb2dd172bde623d7112a1bd674fc0e3c4cae4` contains the required read-only pin/IOMMU path; only a successful post-upgrade runtime probe enables the positive path, which is not physically validated here. |
 | Quantized batch-one GEMV? | **GO for native 288x288, 512x2560, and 10240x2560 Q4_0 plus the 288x288 BF16 reference**. All four registered variants pass together in one physical backend instance; the production variants reach 6.91 and 19.25 GB/s without repacking or a secondary immutable-weight copy. Broader dtype/shape coverage remains open. |
-| ROCm comparison and hybrid value? | **Capability scheduling, shared weights, and a real small-GGUF hybrid graph GO; performance NO-GO for the measured isolated shapes.** Normal `[ROCm,XDNA,CPU]` order keeps `pp32` off XDNA and executes 48 XDNA projections for `tg2` from one `ROCm_Host` model allocation, with persistent page-window registrations and zero immutable-weight copy. Fair synchronized HIP is about 4.4-5.0x faster at 512x2560 and 4.7-4.9x at 10240x2560; HIP is about 12x faster at 288x288. Fused K/V saves one XDNA command floor but remains slower than HIP, and the tested gate/up pair is slower than two optimized XDNA calls. No end-to-end hybrid performance win is claimed. |
+| ROCm comparison and hybrid value? | **Capability scheduling, shared weights, and a real small-GGUF hybrid graph GO; performance NO-GO for the measured isolated shapes.** The physical pre-policy path kept `pp32` off XDNA and executed 48 XDNA projections for `tg2` from one `ROCm_Host` model allocation, with persistent page-window registrations and zero immutable-weight copy. Current normal `[ROCm,XDNA,CPU]` order leaves mutually supported decode on ROCm; `GGML_XDNA_PREFER_OFFLOAD=1` is the explicit control for reproducing intentional XDNA placement. Fair synchronized HIP is about 4.4-5.0x faster at 512x2560 and 4.7-4.9x at 10240x2560; HIP is about 12x faster at 288x288. Fused K/V saves one XDNA command floor but remains slower than HIP, and the tested gate/up pair is slower than two optimized XDNA calls. No end-to-end hybrid performance win is claimed. |
 | NPU utilization and energy? | **OPEN**: installed XRT/sysfs exposes neither a per-kernel utilization/energy counter nor estimated NPU power (`Estimated Power: N/A`); external SoC telemetry is required. |
 
 The experiment is a no-go if direct-layout Q4_0 cannot beat HIP after activation
