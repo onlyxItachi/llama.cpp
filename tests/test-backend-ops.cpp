@@ -9639,6 +9639,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_BF16, GGML_TYPE_F32, 288, 1, 288, {1, 1}, {1, 1}));
     // Gemma 4 E4B sliding-window K/V projection shape used by ggml-xdna.
     test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_Q4_0, GGML_TYPE_F32, 512, 1, 2560, {1, 1}, {1, 1}));
+    // Gemma 4 E4B gate/up projection shape used by ggml-xdna.
+    test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_Q4_0, GGML_TYPE_F32, 10240, 1, 2560, {1, 1}, {1, 1}));
 
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
     for (int64_t n : {1, 7, 8, 9, 16, 128, 512}) {
@@ -10854,6 +10856,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_Q4_0, GGML_TYPE_F32, 288, 1, 288, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_BF16, GGML_TYPE_F32, 288, 1, 288, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_Q4_0, GGML_TYPE_F32, 512, 1, 2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_Q4_0, GGML_TYPE_F32, 10240, 1, 2560, {1, 1}, {1, 1}));
 
     // FWHT tests
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1, 128));

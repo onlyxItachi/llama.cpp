@@ -4,9 +4,10 @@ This directory contains MIT-licensed kernels and artifact tooling written
 for this experiment, plus Apache-2.0-with-LLVM-exception IRON generators adapted
 from Xilinx/mlir-aie. The meaningful path directly consumes native GGML
 `Q4_0[288,288] x F32[288,1]`; the BF16 version is retained as a simpler plumbing
-reference. The first production-shape specialization covers the Gemma 4 E4B
-sliding-window K/V projection `Q4_0[2560,512] x F32[2560,1]`. The host converts
-only the small activation to BF16, while weights
+reference. Production-shape specializations cover the Gemma 4 E4B
+sliding-window K/V projection `Q4_0[2560,512] x F32[2560,1]` and its gate/up
+projection `Q4_0[2560,10240] x F32[2560,1]`. The host converts only the small
+activation to BF16, while weights
 remain in their registered GGML host allocation. The Q4_0 compute kernel uses
 AIE2P packed-nibble vector unpack, int8-to-BF16 conversion, vector multiply and
 vector reduction. The optimized Q4_0 artifact distributes the nine 32-row
@@ -21,26 +22,27 @@ make IRON_ENV=/path/to/ironenv
 export GGML_XDNA_AIE2P_Q4_0_GEMV_BUNDLE="$PWD/gemv-q4_0-288.ggmlxdna"
 ```
 
-For the E4B K/V projection artifact, configure its registered bundle:
+For the E4B K/V and gate/up projection artifacts, configure their registered
+bundles:
 
 ```sh
 export GGML_XDNA_AIE2P_Q4_0_GEMV_M512_K2560_BUNDLE="$PWD/gemv-q4_0-m512-k2560.ggmlxdna"
+export GGML_XDNA_AIE2P_Q4_0_GEMV_M10240_K2560_BUNDLE="$PWD/gemv-q4_0-m10240-k2560.ggmlxdna"
 ```
 
 The runtime discovers every configured registered bundle, creates one
 persistent XRT state per artifact, and selects among them from the generic
-`xdna_problem` metadata. It is therefore valid to configure both the 288x288
-bring-up artifact and the E4B K/V artifact in one backend instance. The
-registry order is used only when more than one variant matches the same
-problem.
+`xdna_problem` metadata. It is therefore valid to configure multiple shape
+specializations in one backend instance. Registry order is used only when more
+than one variant matches the same problem.
 
 To make the BF16 reference available as well, set
-`GGML_XDNA_AIE2P_BF16_GEMV_BUNDLE`. The bundle header couples the declared kernel kind, fixed tensor ABI,
-xclbin, and instruction stream. It prevents accidentally selecting a correctly
-generated BF16 bundle through the Q4 variable (and vice versa) before
-advertising `MUL_MAT` support. Bundles remain trusted executable inputs: the
-header does not prove that a manually relabeled arbitrary xclbin implements its
-declared contract.
+`GGML_XDNA_AIE2P_BF16_GEMV_BUNDLE`. The bundle header couples the declared
+kernel kind, fixed tensor ABI, xclbin, and instruction stream. It prevents
+accidentally selecting a correctly generated BF16 bundle through the Q4
+variable (and vice versa) before advertising `MUL_MAT` support. Bundles remain
+trusted executable inputs: the header does not prove that a manually relabeled
+arbitrary xclbin implements its declared contract.
 
 The artifact exercised during initial bring-up was built with MLIR-AIE Python
 package 1.3.4 and Peano/llvm-aie commit
@@ -80,3 +82,18 @@ worker receives 16 contiguous rows (23,040 bytes) and the activation is
 broadcast once. The core DMA descriptor length is measured in 32-bit address
 granules on AIE2P, so that payload occupies 5,760 of the available 16,383
 granules. Weights stay in native row-major GGML Q4_0 layout.
+
+The E4B gate/up specialization uses the same 32-tile and eight-stream spatial
+mapping for twenty 512-row waves. Each worker holds the single BF16 activation
+object across all waves, while weights and outputs advance in 16-row tiles.
+Depth-one FIFOs preserve the validated forwarding behavior of the pinned
+toolchain. Physical RyzenAI-npu4 measurements with persistent XRT state and
+required per-call activation/output synchronization produced exact CPU-reference
+agreement and approximately 1.05 ms steady-state latency (14.0 GB/s over the
+14,745,600-byte native-Q4_0 matrix). A 15-weight-stream experiment was 0.9-1.3%
+slower and nearly doubled the controller instruction stream, so it is not
+included. This result used MLIR-AIE 1.3.4, Peano
+`cb664e8cc3eb42a12e3ad3cee28729785ffa97a3`, and XRT 2.20.0; generated artifacts
+remain local and must be rebuilt for distribution. The physically validated
+ABI-v1 bundle was 189,971 bytes with SHA-256
+`7aad3b566e3059cffb81b3f19739f7bab830fbf26f73e2ebc017255e4e56be67`.

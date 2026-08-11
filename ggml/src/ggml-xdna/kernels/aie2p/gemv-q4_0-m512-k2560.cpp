@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 
-// E4B sliding-window K/V projection specialization. All 32 AIE2P cores
-// process one contiguous 16-row native-GGML-Q4_0 object each.
+// K=2560 compute-tile kernel shared by the registered M=512 and M=10240
+// specializations. One AIE2P core processes one contiguous 16-row
+// native-GGML-Q4_0 object per invocation.
 
 #include <aie_api/aie.hpp>
 #include <stdint.h>
