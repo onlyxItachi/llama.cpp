@@ -21,19 +21,21 @@ make IRON_ENV=/path/to/ironenv
 export GGML_XDNA_AIE2P_Q4_0_GEMV_BUNDLE="$PWD/gemv-q4_0-288.ggmlxdna"
 ```
 
-For the E4B K/V projection artifact, configure only its registered bundle:
+For the E4B K/V projection artifact, configure its registered bundle:
 
 ```sh
 export GGML_XDNA_AIE2P_Q4_0_GEMV_M512_K2560_BUNDLE="$PWD/gemv-q4_0-m512-k2560.ggmlxdna"
 ```
 
-The current runtime loads one configured full-array artifact. Unset the other
-bundle variables when selecting a production shape; multi-design artifact
-loading remains a separate runtime milestone.
+The runtime discovers every configured registered bundle, creates one
+persistent XRT state per artifact, and selects among them from the generic
+`xdna_problem` metadata. It is therefore valid to configure both the 288x288
+bring-up artifact and the E4B K/V artifact in one backend instance. The
+registry order is used only when more than one variant matches the same
+problem.
 
-To select the BF16 reference instead, set
-`GGML_XDNA_AIE2P_BF16_GEMV_BUNDLE`. Q4_0 takes priority if both bundles are
-set. The bundle header couples the declared kernel kind, fixed tensor ABI,
+To make the BF16 reference available as well, set
+`GGML_XDNA_AIE2P_BF16_GEMV_BUNDLE`. The bundle header couples the declared kernel kind, fixed tensor ABI,
 xclbin, and instruction stream. It prevents accidentally selecting a correctly
 generated BF16 bundle through the Q4 variable (and vice versa) before
 advertising `MUL_MAT` support. Bundles remain trusted executable inputs: the
