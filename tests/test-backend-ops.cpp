@@ -4823,9 +4823,9 @@ static uint32_t test_mix32(uint32_t value) {
     return value;
 }
 
-// Reproducible native-BF16 coverage for the physically validated XDNA gate/up
-// shape. One bounded dense case also carries finite BF16 encoding edge cases;
-// this keeps the ordinary backend suite from duplicating a 32 MiB weight test
+// Reproducible native-BF16 coverage for physically validated XDNA gate/up
+// shapes. One bounded dense case also carries finite BF16 encoding edge cases;
+// this keeps the ordinary backend suite from duplicating a large weight test
 // for every directed pattern used by the standalone hardware runner.
 struct test_mul_mat_weight_bf16_deterministic : public test_mul_mat_weight {
     using test_mul_mat_weight::test_mul_mat_weight;
@@ -9823,6 +9823,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_BF16, GGML_TYPE_F32, 288, 1, 288, {1, 1}, {1, 1}));
     // Llama 3.2 1B gate/up projection shape used by ggml-xdna.
     test_cases.emplace_back(new test_mul_mat_weight_bf16_deterministic(GGML_TYPE_BF16, GGML_TYPE_F32, 8192, 1, 2048, {1, 1}, {1, 1}));
+    // Llama 3.2 3B gate/up projection shape used by ggml-xdna.
+    test_cases.emplace_back(new test_mul_mat_weight_bf16_deterministic(GGML_TYPE_BF16, GGML_TYPE_F32, 8192, 1, 3072, {1, 1}, {1, 1}));
     // Gemma 4 E4B sliding-window K/V projection shape used by ggml-xdna.
     test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_Q4_0, GGML_TYPE_F32, 512, 1, 2560, {1, 1}, {1, 1}));
     // Gemma 4 E4B gate/up projection shape used by ggml-xdna.
@@ -11044,6 +11046,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_Q4_0, GGML_TYPE_F32, 288, 1, 288, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_BF16, GGML_TYPE_F32, 288, 1, 288, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_weight_bf16_deterministic(GGML_TYPE_BF16, GGML_TYPE_F32, 8192, 1, 2048, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_weight_bf16_deterministic(GGML_TYPE_BF16, GGML_TYPE_F32, 8192, 1, 3072, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_Q4_0, GGML_TYPE_F32, 512, 1, 2560, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_Q4_0, GGML_TYPE_F32, 10240, 1, 2560, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_weight_q8_0_deterministic(GGML_TYPE_Q8_0, GGML_TYPE_F32, 9216, 1, 2560, {1, 1}, {1, 1}));

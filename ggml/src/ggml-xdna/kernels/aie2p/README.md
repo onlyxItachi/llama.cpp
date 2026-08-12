@@ -7,7 +7,8 @@ from Xilinx/mlir-aie. The meaningful path directly consumes native GGML
 reference. Production-shape specializations cover the Gemma 4 E4B
 sliding-window K/V projection `Q4_0[2560,512] x F32[2560,1]` and its gate/up
 projection `Q4_0[2560,10240] x F32[2560,1]`, plus the Llama 3.2 1B gate/up
-projection `BF16[2048,8192] x F32[2048,1]`. A native
+projection `BF16[2048,8192] x F32[2048,1]` and the Llama 3.2 3B gate/up
+projection `BF16[3072,8192] x F32[3072,1]`. A native
 `Q8_0[2560,9216] x F32[2560,1]` specialization covers the Qwen 3.5 4B gate/up
 shape. The host converts only the small activation to BF16, while weights
 remain in their registered GGML host allocation. The Q4_0 compute kernel uses
@@ -56,6 +57,7 @@ export GGML_XDNA_AIE2P_Q4_0_GEMV_M512_K2560_BUNDLE="$PWD/gemv-q4_0-m512-k2560.gg
 export GGML_XDNA_AIE2P_Q4_0_GEMV_M10240_K2560_BUNDLE="$PWD/gemv-q4_0-m10240-k2560.ggmlxdna"
 export GGML_XDNA_AIE2P_Q8_0_GEMV_M9216_K2560_BUNDLE="$PWD/gemv-q8_0-m9216-k2560.ggmlxdna"
 export GGML_XDNA_AIE2P_BF16_GEMV_M8192_K2048_BUNDLE="$PWD/gemv-bf16-m8192-k2048.ggmlxdna"
+export GGML_XDNA_AIE2P_BF16_GEMV_M8192_K3072_BUNDLE="$PWD/gemv-bf16-m8192-k3072.ggmlxdna"
 ```
 
 The runtime discovers and host-validates every configured registered bundle. An exact `supports_op` query lazily resolves one shared device XRT program, and the first compute creates the backend-local BO and run state. It is therefore valid to configure multiple shape specializations in one backend instance without loading programs for shapes absent from the graph. Registry order is used only when more than one variant matches the same problem. Current full-array artifacts share one per-device XRT state and command gate across backend instances.
@@ -85,7 +87,7 @@ The 64-byte `GGXDNA1` container header has two supported ABI layouts. Existing A
 
 ABI v2 requires an exact match between the header ID and the registry variant. Unknown IDs, unknown variant architectures, cross-generation IDs, and nonzero reserved bytes are rejected before XRT sees the payload. A future AIE2 artifact must use ABI v2; this format support does not add an AIE2 registry entry or a physical XDNA1 support claim.
 
-The packer continues to emit ABI-v1 AIE2P bundles for existing Makefile calls. ABI v2 must name both the version and architecture explicitly, for example `pack-artifact.py --abi-version 2 --architecture aie2p ...`. `--architecture aie2` with ABI v1, ABI v2 without `--architecture`, unsupported versions, and unknown architecture names fail closed.
+Every AIE2P Makefile rule names `--abi-version 1 --architecture aie2p` explicitly. ABI v2 must likewise name both the version and architecture, for example `pack-artifact.py --abi-version 2 --architecture aie2p ...`. `--architecture aie2` with ABI v1, ABI v2 without `--architecture`, unsupported versions, and unknown architecture names fail closed.
 
 The artifact exercised during initial bring-up was built with MLIR-AIE Python
 package 1.3.4 and Peano/llvm-aie commit
@@ -257,15 +259,47 @@ SHA-256
 its instruction stream
 has SHA-256
 `91d5b29a0b6ff922d2a7ef1ae2ab1eee2316eaeccf82b402f71721771f3adcfc`.
-Those are the physically validated artifact hashes. A fresh Makefile rebuild
-reproduced the MLIR, compute object, addressed MLIR, PDI, and instruction
-stream byte-for-byte; `xclbinutil` assigned a new xclbin UUID, so the rebuilt
-xclbin and enclosing bundle have different container hashes.
+Those are the original physically validated artifact hashes. A fresh
+generic-source Makefile rebuild reproduced the generated and addressed MLIR,
+PDI, and instruction stream byte-for-byte. The complete compute ELF differs
+only in source-file metadata; its code, allocated, relocation, comment, and
+stack sections and normalized symbols match, as do the corresponding sections
+in all 32 placed ELFs. `xclbinutil` assigned a new xclbin UUID and embedded
+path, so the rebuilt xclbin and enclosing bundle have different container
+hashes: respectively
+`4eeea09a4b41f023fe8fde02ad7f9d2610b9de0d5b11d094b89005334d0374e9`
+and
+`59d1c4b6aa0313c12a37bf72cb8f6ff5f8dc29eb55bc3afc1b80af6e0b2bcb2c`.
+The old and rebuilt programs each passed one full `verify_each` launch for
+both `edge` and `special_finite`, exactly matching the long-double reference
+with zero mismatches, non-finites, absolute/relative error, NMSE, sentinel
+corruption, weight mutation, or weight-payload copies. The old/new raw-log
+SHA-256 values are, for `edge`,
+`a2b2a2c04ccbb874fe7e46b4b4fca7783606b8fb2a616db6f56124f0b6617423`
+and
+`878a73bfe524db3ce99561776fa1500592a2623ca20aac4ca00f0f7b772f1331`,
+and for `special_finite`,
+`f850aed5685b790ce2c0ad312f8320ac1de281f9eae188059cb3a6ddbe37a25a`
+and
+`127be011d6c5d7e0711a07cfb239ed8441d5e75be0f39d8d7e1f607006222396`.
 
-The ordinary GGML backend test also loaded the physically validated bundle
-alongside the other five registered artifacts and passed all six CPU-reference
-cases with zero weight-copy bytes. That coexistence log has SHA-256
-`3558dd263fb259326b14e41f00669ebe6b85ba5798195a8d64c75a6fcf547f27`.
+One ordinary dynamic-backend process then configured all seven AIE2P bundles.
+Its inventory began at `ready=0`, `untried=7`, `failed=0`; lazy resolution
+reached every specialization and all seven exact CPU-reference cases passed.
+The final counters report seven successful calls/submissions, seven root
+registrations (`118.898 MiB`), seven weight views, 42 explicit payload BOs
+totalling 125,084,806 bytes, seven one-time weight syncs totalling 124,649,024
+bytes, and zero weight-payload copies. The raw coexistence log has SHA-256
+`912be8cf9728dd20aa9ad6b8d52310c4929e71998840704f2909bef442a7959d`.
+The durable K=2048/integration report and evidence manifest have SHA-256
+`2c5c11571669b1482335b82e92055772ec441c7fddde634c868e0214146f87f5`
+and
+`3db7f3c853bc6f29d16784b82459f70434146400d83536cb3ef0b9088b036c34`.
+The device process itself exited successfully. Its first wrapper revision then
+reported a false negative because lazy-resolution messages split six `OK`
+markers from their `MUL_MAT` lines; the frozen raw log passed an exact
+seven-case/counter audit, and the corrected post-parser passed `bash -n` and
+`shellcheck` without rerunning the already complete device process.
 
 The fair single-call gfx1151 control was faster. Across a clean D-H-H-D order,
 the mean of two trial medians was 388.104 us for a device-resident BF16 weight
@@ -273,3 +307,61 @@ and 391.938 us for the same persistent weight in `ROCm_Host`. XDNA was 1.858x
 and 1.840x slower respectively. The registry therefore exposes this
 specialization for explicit coverage and XDNA-only use but keeps
 `prefer_for_offload=false`.
+
+The BF16 M=8192, K=3072 specialization is the Llama 3.2 3B gate/up shape. Its
+source is `unsloth/Llama-3.2-3B-Instruct-GGUF`, file
+`Llama-3.2-3B-Instruct-BF16.gguf`, revision
+`e7d0997e49c9cb00d88b4c1a6a16aa894b0bbc31`. The 6,433,687,744-byte file has
+SHA-256
+`9b8dce13b6cbcd8b20037bd6383ee8e747b5034ca32f40b5b8ee2efa9ebf56b8`.
+A strict one-launch runner read only `blk.0.ffn_gate.weight` at byte offset
+846,186,688. That 50,331,648-byte BF16 tensor has SHA-256
+`f38192e76c00a2829113cb3202b42df45687d46b68a8682f5b1b0e46073e5ee0`.
+All 8,192 outputs passed a long-double reference with zero mismatches and
+non-finites, NMSE `5.2182310884410422e-15`, unchanged weight bytes, and zero
+post-ingest weight-payload copies.
+
+The fixed K=2048 topology scales to K=3072 with 32 workers, eight rows per
+worker, 32 waves, depth-one FIFOs, and four waves per task group. The pinned
+toolchain's placed MLIR shows a 12-byte IRON state object per worker; this is an
+observed toolchain footprint budgeted by the generator, not an architectural
+constant. Each compute tile uses 59,436 of 65,536 local bytes, leaving 6,100
+bytes. Peano `-O2` and `-O3` produced byte-identical K=3072 compute objects,
+so the Makefile retains `-O2`.
+
+The cache-only candidate passed seven directed patterns twice and independent
+1,001- and 10,001-launch closures. The 10,001-call kernel-only p50 was
+1,045.054 us (48.162 GB/s); verified full p50 was 1,044.585 us. Clean,
+order-balanced 1,001-call HIP controls measured 526.994 us kernel p50 and
+549.750 us verified-full p50 for `ROCm0`, and 539.854 us and 583.869 us for
+`ROCm_Host`. XDNA was 1.789x to 1.983x slower, so the descriptor keeps
+`prefer_for_offload=false`. The complete standalone K=3072 report has SHA-256
+`360e9c724daa27c35c4883e5ed962c931d42468e0788ada437991008c670ca34`.
+
+The generic K=2048 A/B regression and the ordinary seven-artifact
+`test-backend-ops` process described above close the remaining integration
+gates. K=3072 is therefore physically validated as part of the tracked
+seven-specialization backend while remaining deliberately opt-in on the
+measured HIP comparison. The final generic-source K=3072 xclbin and bundle
+have SHA-256
+`d6d93d241749c25f6523d989d4f100c31e2003931d940fa599f6f35d0e831dfd`
+and
+`6c8022bd11b30b9e4fcd0824f4f72524b3ebf14dd4c2cc2c83dbb8572c012385`;
+the instruction stream remains byte-identical to the standalone candidate.
+
+A separate K=3072 ping-pong experiment used four rows per worker, 128 rows per
+wave, 64 waves, and depth-two weight/output FIFOs. All seven directed patterns,
+the exact pinned tensor, and a 1,001-launch alternating FIFO-parity case passed.
+Its bundle and instruction SHA-256 values are
+`2443282a1dd8300b4313012fc62f42b581eeae93d5b33fd6c0cfd3bdaeafaadd`
+and
+`9a1862a4db88d770df617b12d86ad729b9c16e9166a9bfa8dbc9bc4eeba3b6ee`.
+Clean balanced p50 was 1.2232145 ms full versus 1.0663185 ms for depth one
+(14.714% slower), and 1.197059 ms kernel-only versus 1.0363775 ms (15.504%
+slower). The retained design therefore remains eight rows per worker with
+depth-one FIFOs. The physical-log and balanced-result manifests have SHA-256
+`497f0fa807c218c0781f48ba5f442e380e9d829adcc29b22c6ddcdb73e3c2e2e`
+and
+`cdf06776693f86702f1a0d54ccf0a8b893365790ffd003ba91940637c3e41def`.
+The final depth-two rejection report has SHA-256
+`1cee68e52bdf4c296fd1e0755f353836e024ba0c51f57a1c3c84981d94d25306`.

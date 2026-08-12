@@ -26,10 +26,12 @@ int main() {
     }
 
     const ggml_xdna::xdna_kernel_variant * bf16_m8192 = nullptr;
+    const ggml_xdna::xdna_kernel_variant * bf16_m8192_k3072 = nullptr;
     for (size_t i = 0; i < variant_count; ++i) {
         if (strcmp(variants[i].id, "aie2p-bf16-gemv-m8192-n1-k2048") == 0) {
             bf16_m8192 = &variants[i];
-            break;
+        } else if (strcmp(variants[i].id, "aie2p-bf16-gemv-m8192-n1-k3072") == 0) {
+            bf16_m8192_k3072 = &variants[i];
         }
     }
     require(bf16_m8192 != nullptr, "the BF16 M8192 K2048 variant is missing");
@@ -39,6 +41,16 @@ int main() {
                 bf16_m8192->device_output_bytes == 8192 * sizeof(float) &&
                 bf16_m8192->rows_per_worker == 8 && bf16_m8192->worker_count == 32,
             "the BF16 M8192 K2048 artifact contract changed");
+    require(bf16_m8192_k3072 != nullptr, "the BF16 M8192 K3072 variant is missing");
+    require(
+            bf16_m8192_k3072->architecture == ggml_xdna::device_architecture::aie2p &&
+                bf16_m8192_k3072->artifact_kind == 1 && bf16_m8192_k3072->artifact_abi_version == 1 &&
+                bf16_m8192_k3072->weight_bytes == 8192 * 3072 * sizeof(uint16_t) &&
+                bf16_m8192_k3072->device_activation_bytes == 3072 * sizeof(uint16_t) &&
+                bf16_m8192_k3072->device_output_bytes == 8192 * sizeof(float) &&
+                bf16_m8192_k3072->rows_per_worker == 8 && bf16_m8192_k3072->worker_count == 32 &&
+                !bf16_m8192_k3072->prefer_for_offload,
+            "the BF16 M8192 K3072 artifact contract changed");
 
     ggml_xdna::xdna_problem problem;
     problem.architecture = ggml_xdna::device_architecture::aie2p;
@@ -66,10 +78,22 @@ int main() {
             ggml_xdna::select_kernel_variant(problem, candidates, 1) == bf16_m8192,
             "generic selection did not choose the BF16 M8192 K2048 variant");
 
-    problem.n = 2;
+    problem.k = 3072;
     require(
             !ggml_xdna::kernel_variant_supports(*bf16_m8192, problem),
-            "the BF16 M8192 K2048 variant accepted a batched problem");
+            "the BF16 M8192 K2048 variant accepted K3072");
+    require(
+            ggml_xdna::kernel_variant_supports(*bf16_m8192_k3072, problem),
+            "the BF16 M8192 K3072 problem did not match its variant");
+    const ggml_xdna::xdna_kernel_variant * k3072_candidates[] = { bf16_m8192, bf16_m8192_k3072 };
+    require(
+            ggml_xdna::select_kernel_variant(problem, k3072_candidates, 2) == bf16_m8192_k3072,
+            "generic selection did not choose the BF16 M8192 K3072 variant");
+
+    problem.n = 2;
+    require(
+            !ggml_xdna::kernel_variant_supports(*bf16_m8192_k3072, problem),
+            "the BF16 M8192 K3072 variant accepted a batched problem");
 
     ggml_xdna::xdna_kernel_variant variant = {};
 

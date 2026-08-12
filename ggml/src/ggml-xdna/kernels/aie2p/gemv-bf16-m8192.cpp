@@ -2,11 +2,21 @@
 
 #include <aie_api/aie.hpp>
 
+#ifndef GGML_XDNA_BF16_COLUMNS
+#error "GGML_XDNA_BF16_COLUMNS must name the compile-time K dimension"
+#endif
+
+#ifndef GGML_XDNA_BF16_KERNEL_NAME
+#error "GGML_XDNA_BF16_KERNEL_NAME must name the exported kernel symbol"
+#endif
+
 namespace {
 
-constexpr int kColumns = 2048;
+constexpr int kColumns = GGML_XDNA_BF16_COLUMNS;
 constexpr int kVectorSize = 32;
 constexpr int kRowsPerWorker = 8;
+
+static_assert(kColumns > 0 && kColumns % kVectorSize == 0);
 
 __aie_inline void dot_rows_3(const bfloat16 * weights, const bfloat16 * activation, float * output) {
     auto acc0 = aie::zeros<accfloat, kVectorSize>();
@@ -48,11 +58,17 @@ __aie_inline void dot_rows_2(const bfloat16 * weights, const bfloat16 * activati
 
 extern "C" {
 
-void gemv_bf16_f32_m8_k2048(const bfloat16 * weights, const bfloat16 * activation, float * output) {
+void GGML_XDNA_BF16_KERNEL_NAME(
+        const bfloat16 * weights,
+        const bfloat16 * activation,
+        float * output) {
     for (int row = 0; row < kRowsPerWorker - 2; row += 3) {
         dot_rows_3(weights + row * kColumns, activation, output + row);
     }
-    dot_rows_2(weights + (kRowsPerWorker - 2) * kColumns, activation, output + (kRowsPerWorker - 2));
+    dot_rows_2(
+        weights + (kRowsPerWorker - 2) * kColumns,
+        activation,
+        output + (kRowsPerWorker - 2));
 }
 
 }

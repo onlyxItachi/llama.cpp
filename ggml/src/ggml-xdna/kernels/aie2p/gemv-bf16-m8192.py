@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 # IRON object-FIFO plumbing adapted from Xilinx/mlir-aie's matrix-vector programming example at commit a8fea363dfd63015cffd380e0679950419a0a7cd.
 
-"""Generate a 32-core native-BF16 GEMV for M=8192, N=1, K=2048."""
+"""Generate a 32-core native-BF16 GEMV for M=8192, N=1 and a compile-time K."""
+
+import argparse
 
 import numpy as np
 from ml_dtypes import bfloat16
@@ -13,9 +15,8 @@ from aie.iron.controlflow import range_
 from aie.iron.device import NPU2, Tile
 
 
-def build_program():
+def build_program(columns: int, kernel_symbol: str, kernel_object: str):
     rows = 8192
-    columns = 2048
     group_count = 8
     workers_per_group = 4
     worker_count = group_count * workers_per_group
@@ -26,12 +27,30 @@ def build_program():
     task_group_waves = 4
     bf16_bytes = 2
     f32_bytes = 4
+    stack_bytes = 0x1000
+    # The pinned toolchain's placed MLIR materializes this per worker.
+    toolchain_observed_iron_state_bytes = 12
+    core_memory_bytes = 64 * 1024
+    memtile_memory_bytes = 512 * 1024
+    core_dma_word_limit = (1 << 14) - 1
 
+    assert columns > 0 and columns % 32 == 0
     assert worker_count == 32
     assert rows_per_wave == 256
     assert wave_count == 32
-    assert rows_per_worker * columns * bf16_bytes // 4 <= (1 << 14) - 1
-    assert rows_per_group * columns * bf16_bytes + rows_per_group * f32_bytes <= 512 * 1024
+    assert rows_per_worker * columns * bf16_bytes // 4 <= core_dma_word_limit
+    assert (
+        stack_bytes
+        + rows_per_worker * columns * bf16_bytes
+        + columns * bf16_bytes
+        + rows_per_worker * f32_bytes
+        + toolchain_observed_iron_state_bytes
+        <= core_memory_bytes
+    )
+    assert (
+        rows_per_group * columns * bf16_bytes + rows_per_group * f32_bytes
+        <= memtile_memory_bytes
+    )
 
     bf16_type = np.dtype[bfloat16]
     f32_type = np.dtype[np.float32]
@@ -45,8 +64,8 @@ def build_program():
     worker_output_type = np.ndarray[(rows_per_worker,), f32_type]
 
     gemv = Kernel(
-        "gemv_bf16_f32_m8_k2048",
-        "gemv-bf16-m8192-k2048.o",
+        kernel_symbol,
+        kernel_object,
         [worker_weight_type, activation_tile_type, worker_output_type],
     )
 
@@ -60,7 +79,9 @@ def build_program():
             output_fifo.release(1)
         activation_fifo.release(1)
 
-    activation_fifo = ObjectFifo(activation_tile_type, depth=1, name="activation_bf16_broadcast")
+    activation_fifo = ObjectFifo(
+        activation_tile_type, depth=1, name="activation_bf16_broadcast"
+    )
     group_weight_fifos = [
         ObjectFifo(group_weight_type, depth=1, name=f"weights_group_{group}")
         for group in range(group_count)
@@ -73,7 +94,10 @@ def build_program():
                 tile=Tile(group, 1),
                 depths=[1] * workers_per_group,
                 obj_types=[worker_weight_type] * workers_per_group,
-                names=[f"weights_group_{group}_worker_{worker}" for worker in range(workers_per_group)],
+                names=[
+                    f"weights_group_{group}_worker_{worker}"
+                    for worker in range(workers_per_group)
+                ],
             )
         )
 
@@ -89,7 +113,10 @@ def build_program():
                 tile=Tile(group, 1),
                 depths=[1] * workers_per_group,
                 obj_types=[worker_output_type] * workers_per_group,
-                names=[f"output_group_{group}_worker_{worker}" for worker in range(workers_per_group)],
+                names=[
+                    f"output_group_{group}_worker_{worker}"
+                    for worker in range(workers_per_group)
+                ],
             )
         )
 
@@ -108,7 +135,7 @@ def build_program():
                 gemv,
             ],
             tile=worker_tiles[worker],
-            stack_size=0x1000,
+            stack_size=stack_bytes,
         )
         for worker in range(worker_count)
     ]
@@ -166,5 +193,19 @@ def build_program():
     print(Program(NPU2(), runtime).resolve_program())
 
 
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--columns", required=True, type=int)
+    parser.add_argument("--kernel-symbol")
+    parser.add_argument("--kernel-object")
+    args = parser.parse_args()
+    if args.kernel_symbol is None:
+        args.kernel_symbol = f"gemv_bf16_f32_m8_k{args.columns}"
+    if args.kernel_object is None:
+        args.kernel_object = f"gemv-bf16-m8192-k{args.columns}.o"
+    return args
+
+
 if __name__ == "__main__":
-    build_program()
+    arguments = parse_args()
+    build_program(arguments.columns, arguments.kernel_symbol, arguments.kernel_object)
