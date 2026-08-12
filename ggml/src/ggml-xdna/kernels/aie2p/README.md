@@ -354,10 +354,12 @@ The tracked generator now replaces the 256 one-wave weight tasks and 256
 one-wave output tasks with eight 32-wave repeated tasks for each stream. With
 activation, this deliberately reduces shim tasks from 513 to 17 and controller
 bytes from 72,884 to 2,452. The compute kernel, depth-one FIFOs, memory layout,
-locks, routes, 32 cores, 112 flows, and 16 links remain unchanged; non-runtime
-addressed MLIR and all 32 placed core ELFs matched the retained controls. The
-Makefile runs a fail-closed controller decoder after `aiecc` for both K values
-and before packaging.
+locks, routes, 32 cores, 112 flows, and 16 links remain unchanged. Non-runtime
+addressed MLIR matched the retained controls, and the K=2048 placed core ELFs
+were byte-identical. Each K=3072 placed core differed only in non-loadable
+`STT_FILE` source-name metadata; its executable sections and normalized
+executable symbols were identical. The Makefile runs a fail-closed controller
+decoder after `aiecc` for both K values and before packaging.
 
 At K=2048, the 15/15 physical matrix passed all parity/directed/sustained
 checks and exact bounded reads of both Llama 1B gate and up tensors. A balanced
@@ -372,6 +374,39 @@ and kernel p50 improved by 7.232% and 8.353%. Its final report has SHA-256
 `5aa8131d9bdc3b681a87d80848b71464f7f8ee77b9f5b92f44d1fe3b54e70b6c`.
 HIP remains faster for both shapes, so both descriptors retain
 `prefer_for_offload=false`.
+
+An exact-head forced-C functional diagnostic then exercised the pinned Llama
+3.2 3B BF16 GGUF at commit
+`df255f7cf15f720995799b23b579ca05b5394d3e`. The correctness action matched
+the frozen profile-B generated text exactly, SHA-256
+`8f30d3a7df78841054291d938139e9e3d46b52955484fac1c3e1061e28cabf94`,
+and recorded 7,118 successful XDNA calls, 56 root registrations, and zero
+immutable-weight copy bytes. A separate `pp16` plus `tg4` graph action placed
+exactly `ffn_gate-0..27` and `ffn_up-0..27` on XDNA. The `pp16` topology had
+195 ROCm `MUL_MAT` identities plus `ffn_gate-27` and `ffn_up-27` on XDNA, with
+two XDNA calls and two registrations. The `tg4` topology had 141 ROCm
+`MUL_MAT` identities plus all 56 gate/up identities on XDNA, with 224 XDNA
+calls and 56 registrations. Their deduplicated union contains 197 logical
+`MUL_MAT` identities, 197 ROCm-tagged entries, and 56 additional XDNA-tagged
+entries, for 253 backend-tagged entries total. All 28 Flash Attention
+identities were on ROCm. The graph action therefore recorded 226 successful
+XDNA calls, 58 root registrations, and zero immutable-weight copy bytes. The
+frozen correctness stdout/stderr and graph
+stderr/census summary have SHA-256
+`dfb9e1ae37d3d972628de1d5b01c8c8af15e60f14fe0b8080fd81c94ad16152d`,
+`970a1d5ebb02a4ac1b1d4ba8780e1f7b6a5c1e201949845a5e8d4f34f61cca08`,
+`372871296b3988f5520db46aeca4049c8bca471eb913da72eb031da585f5e56d`,
+and `e05b53ac9f18ea8e5d438a1c879e77e1cbf1b5398648239e4198bdc5b0dd13dc`.
+
+Both actions moved host-global swap, so every recorded time is invalid:
+correctness moved 406,206 pages in and 511,267 pages out, and graph placement
+moved 2,747 pages in and 10,035 pages out. A matched exact-head H control and
+order-balanced H/C performance remain unrun. This establishes forced-C
+functional and placement GO only; it does not change
+`prefer_for_offload=false`. The final durable report and manifest have SHA-256
+`2ed271d3e84e78be89291e8e34dd5298c99390ac76224bc12b9e86b6a198cf0a`
+and
+`d410c481b7855980902241be179c8116e6425ad45ae3aeed977dd2754747205b`.
 
 A separate K=3072 ping-pong experiment used four rows per worker, 128 rows per
 wave, 64 waves, and depth-two weight/output FIFOs. All seven directed patterns,

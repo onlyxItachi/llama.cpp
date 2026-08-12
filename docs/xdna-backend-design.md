@@ -517,8 +517,10 @@ output tasks. Including activation, this intentionally reduces the shim task
 count from 513 to 17 and the controller stream from 72,884 to 2,452 bytes.
 The numerical kernel, 32 cores, 112 flows, 16 links, depth-one FIFOs, routes,
 locks, memory placement, and host ABI are unchanged. Static comparison found
-the non-runtime addressed MLIR identical and all 32 placed core ELFs
-byte-identical. A post-`aiecc` verifier checks the exact v0.1 operation order,
+the non-runtime addressed MLIR identical. The K=2048 placed core ELFs were
+byte-identical. Each K=3072 placed core differed only in non-loadable `STT_FILE`
+source-name metadata; its executable sections and normalized executable symbols
+were identical. A post-`aiecc` verifier checks the exact v0.1 operation order,
 absolute shim addresses, reserved fields, repeats, encoded 20-bit strides,
 host offsets, and final buffer endpoints before packaging either K value.
 
@@ -995,11 +997,11 @@ The next execution gates remain separate datasets: A2 measures identical HIP
 execution with shared host placement, B enables XDNA with the automatic policy
 and is expected to retain zero XDNA submissions because every measured
 descriptor currently declines preference, and C forces exact XDNA placement
-only for the registered Llama 1B BF16 and Qwen 4B Q8_0 shapes. A2/B require
-order-balanced throughput and placement parity; C additionally requires
-nonzero XDNA submissions, zero repeated immutable-weight payload copies, and a
-CPU-reference sanity pass. Llama 3B and Qwen 9B must reject C until matching
-tracked kernels exist.
+only for registered shapes, including the Llama 1B and 3B BF16 gate/up shapes
+and the Qwen 4B Q8_0 gate/up shape. A2/B require order-balanced throughput and
+placement parity; C additionally requires nonzero XDNA submissions, zero
+repeated immutable-weight payload copies, and a CPU-reference sanity pass.
+Qwen 9B must reject C until matching tracked kernels exist.
 
 A swap-guarded first A2/B pass completed six functional correctness/placement
 cells before host pressure invalidated further timing work. Llama 1B completed
@@ -1015,11 +1017,57 @@ end-to-end performance result.
 
 The run stopped before Llama 3B Q4_0 after its F16 cells incurred 2.4-124.7 MiB
 swap-in and 31.3-635.8 MiB swap-out per stage. All Qwen A2/B cells and all
-sixteen planned A2/B benchmarks therefore remain unrun, as do the forced-C
-cells. The retained partial report has SHA-256
+sixteen planned A2/B benchmarks therefore remain unrun. The retained partial
+report has SHA-256
 `200214a5f9bb3e0136c889c90f73ac311d6f1e189e947e0dbd594532fd88842a`.
 Single correctness-smoke rates are deliberately excluded from the performance
 table because cache state and host paging differed between profiles.
+
+An exact-head forced-C functional diagnostic subsequently exercised the pinned
+Llama 3.2 3B BF16 model at
+`df255f7cf15f720995799b23b579ca05b5394d3e`. The correctness action generated
+the exact frozen profile-B reference text, SHA-256
+`8f30d3a7df78841054291d938139e9e3d46b52955484fac1c3e1061e28cabf94`,
+and recorded 7,118 successful XDNA calls, 56 root registrations, and zero
+immutable-weight copy bytes. The frozen stdout, stderr, and normalized XDNA
+statistics have SHA-256
+`dfb9e1ae37d3d972628de1d5b01c8c8af15e60f14fe0b8080fd81c94ad16152d`,
+`970a1d5ebb02a4ac1b1d4ba8780e1f7b6a5c1e201949845a5e8d4f34f61cca08`,
+and `9a418e22adcd3a52ac1f48b88f6e972e93d27e37dc769484b1a9edef66b7df0f`.
+
+A separate `pp16` plus `tg4` functional graph action produced the exact 56
+XDNA decode identities `ffn_gate-0..27` and `ffn_up-0..27`. The `pp16`
+topology had 195 ROCm `MUL_MAT` identities plus `ffn_gate-27` and `ffn_up-27`
+on XDNA, with two XDNA calls and two registrations. The `tg4` topology had 141
+ROCm `MUL_MAT` identities plus all 56 gate/up identities on XDNA, with 224
+XDNA calls and 56 registrations. Their deduplicated union contains 197 logical
+`MUL_MAT` identities, 197 ROCm-tagged entries, and the 56 additional
+XDNA-tagged gate/up entries, for 253 backend-tagged entries total. All 28 Flash
+Attention identities were on ROCm. The graph action therefore recorded 226
+successful XDNA calls, 58 root registrations, and zero immutable-weight copy
+bytes. Its stderr, census
+summary, full census, and identical expected/actual XDNA identity lists have
+SHA-256
+`372871296b3988f5520db46aeca4049c8bca471eb913da72eb031da585f5e56d`,
+`e05b53ac9f18ea8e5d438a1c879e77e1cbf1b5398648239e4198bdc5b0dd13dc`,
+`81fc96193af264a0fdc229e2769600cafde77b19b0d547225ebfb76b698dd575`,
+and `245635bcbac594536dd49c91bfb6eb5845791acafcb187168d1c27ef9586184b`.
+The first post-run validator rejected the preserved exit-zero graph log because
+it assumed prefixed placement lines and counted the backend-tagged union as
+unique logical nodes. The corrected offline parser passed the frozen raw
+evidence without rerunning the device process.
+
+Both C actions moved host-global swap: correctness recorded 406,206 pages in
+and 511,267 pages out, while graph placement recorded 2,747 pages in and
+10,035 pages out. Their timings are invalid and support no performance claim.
+A matched exact-head H correctness/graph control and order-balanced H/C
+performance runs remain unrun. This is forced-C functional and placement GO,
+not comparative performance evidence, and it does not change either BF16
+descriptor's `prefer_for_offload=false` policy. The final durable report and
+manifest have SHA-256
+`2ed271d3e84e78be89291e8e34dd5298c99390ac76224bc12b9e86b6a198cf0a`
+and
+`d410c481b7855980902241be179c8116e6425ad45ae3aeed977dd2754747205b`.
 
 ## Native Q4_K research frontier
 
@@ -1173,7 +1221,7 @@ AIE2 requires its own implementation and is not inferred from the tested AIE2P k
 | Reuse without per-token weight copy? | **GO for serialized immutable-buffer lifetimes**: persistent parent/view/run reuse has zero weight-copy bytes, and observer-driven eviction passes exact owner/base/data ABA reuse with two registrations and no hits. Mutable/test weights use one explicit native-byte staging copy per call. Concurrent compute/free/backend teardown is not claimed. |
 | Ordinary read-only GGUF mmap? | **NO on the installed driver, fail-closed automatically**: the complete file-backed `PROT_READ` parent/subview/sync probe fails with errno 12, leaving `mmap_support` and `CPU_Mapped` acceptance disabled. Upstream driver commit `ed8fb2dd172bde623d7112a1bd674fc0e3c4cae4` contains the required read-only pin/IOMMU path; only a successful post-upgrade runtime probe enables the positive path, which is not physically validated here. |
 | Fixed batch-one GEMV? | **GO for seven integrated variants**. Native 288x288, 512x2560, and 10240x2560 Q4_0, native 9216x2560 Q8_0, plus 288x288, 8192x2048, and 8192x3072 BF16 pass together in one physical backend instance. The two production BF16 shapes now use the physically validated 17-task controller; K=2048 passed both exact Llama 1B gate/up tensors and K=3072 passed the exact Llama 3B gate tensor. The cache-only Q4_K row-batched kernel is correctness GO but integration NO-GO at 16.052 GB/s and 5.229x slower than its matched HIP control. Broader dtype/shape coverage remains open. |
-| Four-model real-GGUF inference matrix? | **GO for the 16-cell ROCm-resident A1 correctness, placement, pp512, and tg128 reference; PARTIAL functional GO for six A2/B cells; OPEN for comparative A2/B performance and C.** All requested exact files and four same-type KV modes completed A1 with Flash Attention. Completed A2/B real graphs kept every `MUL_MAT` on ROCm and recorded zero XDNA submissions/copies under automatic policy. Host-global swap stopped the matrix before Llama 3B Q4_0, both Qwen models, every A2/B benchmark, and forced C. TTFT, utilization, energy, and full-matrix HIP node counts remain unmeasured. |
+| Four-model real-GGUF inference matrix? | **GO for the 16-cell ROCm-resident A1 correctness, placement, pp512, and tg128 reference; PARTIAL functional GO for six A2/B cells; forced-C functional and placement GO for exact-head Llama 3B BF16; OPEN for comparative A2/B/C performance.** All requested exact files and four same-type KV modes completed A1 with Flash Attention. Completed A2/B real graphs kept every `MUL_MAT` on ROCm and recorded zero XDNA submissions/copies under automatic policy. Forced C produced the exact frozen reference text. Across its combined `pp16`/`tg4` evidence, every one of the 197 logical `MUL_MAT` identities had a ROCm-tagged entry and the 56 decode gate/up identities additionally had XDNA-tagged entries; all 28 Flash Attention identities were on ROCm and no immutable-weight bytes were copied. Host-global swap invalidated C timing and stopped the wider matrix. A matched exact-head H control, every A2/B/C benchmark, TTFT, utilization, energy, and full-matrix HIP node counts remain unmeasured. |
 | ROCm comparison and hybrid value? | **Capability scheduling, shared weights, and a real small-GGUF hybrid graph GO; performance NO-GO for the measured isolated shapes.** The physical pre-policy path kept `pp32` off XDNA and executed 48 XDNA projections for `tg2` from one `ROCm_Host` model allocation, with persistent page-window registrations and zero immutable-weight copy. Current normal `[ROCm,XDNA,CPU]` order leaves mutually supported decode on ROCm; `GGML_XDNA_PREFER_OFFLOAD=1` is the explicit control for reproducing intentional XDNA placement. Fair synchronized HIP is about 4.4-5.0x faster at Q4_0 512x2560, 4.7-4.9x at Q4_0 10240x2560, 2.94x at Q8_0 9216x2560, 1.70-1.72x at task-fused BF16 8192x2048, 1.68-1.83x at task-fused BF16 8192x3072, and 5.229x at cache-only Q4_K 12288x4096; HIP is about 12x faster at Q4_0 288x288. Larger native-BF16 shapes narrow the gap materially but do not reverse it. All production descriptors therefore keep `prefer_for_offload=false`. Fused K/V saves one XDNA command floor but remains slower than HIP, and the tested gate/up pair is slower than two optimized XDNA calls. No end-to-end hybrid performance win is claimed. |
 | NPU utilization and energy? | **OPEN**: installed XRT/sysfs exposes neither a per-kernel utilization/energy counter nor estimated NPU power (`Estimated Power: N/A`); external SoC telemetry is required. |
 
