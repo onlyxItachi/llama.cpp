@@ -437,15 +437,165 @@ kernel_configuration probe_kernel_configuration(const device_info & info) noexce
     return result;
 }
 
-const kernel_artifact_configuration * select_kernel_configuration(
-        const kernel_configuration & configuration,
-        const xdna_problem & problem) noexcept {
+struct kernel_program {
+    kernel_program(
+            std::shared_ptr<xrt::device> device_value,
+            const kernel_artifact_configuration & configuration) :
+        variant(configuration.variant),
+        device(std::move(device_value)),
+        instructions(configuration.instructions) {
+        if (variant == nullptr) {
+            throw std::runtime_error("XDNA kernel configuration has no selected variant");
+        }
+
+        xclbin = std::make_unique<xrt::xclbin>(configuration.xclbin_data);
+        device->register_xclbin(*xclbin);
+        context = std::make_unique<xrt::hw_context>(*device, xclbin->get_uuid());
+        kernel = std::make_unique<xrt::kernel>(*context, variant->xrt_kernel_name);
+    }
+
+    const xdna_kernel_variant * variant;
+    std::shared_ptr<xrt::device> device;
+    std::vector<uint32_t> instructions;
+    std::unique_ptr<xrt::xclbin> xclbin;
+    std::unique_ptr<xrt::hw_context> context;
+    std::unique_ptr<xrt::kernel> kernel;
+};
+
+namespace {
+
+std::vector<const kernel_artifact_configuration *> artifact_keys(const kernel_configuration & configuration) {
+    std::vector<const kernel_artifact_configuration *> result;
+    result.reserve(configuration.artifacts.size());
     for (const kernel_artifact_configuration & artifact : configuration.artifacts) {
-        if (artifact.variant != nullptr && kernel_variant_supports(*artifact.variant, problem)) {
-            return &artifact;
+        result.push_back(&artifact);
+    }
+    return result;
+}
+
+} // namespace
+
+struct program_cache::impl {
+    impl(device_info info_value, kernel_configuration configuration_value) :
+        info(std::move(info_value)),
+        configuration(std::move(configuration_value)),
+        programs(artifact_keys(configuration)) {}
+
+    std::shared_ptr<kernel_program> resolve(
+            const xdna_problem & problem,
+            const xdna_kernel_variant * previous) {
+        bool passed_previous = previous == nullptr;
+        return programs.resolve_if(
+            [&problem, previous, &passed_previous](const kernel_artifact_configuration * artifact) {
+                if (!passed_previous) {
+                    passed_previous = artifact != nullptr && artifact->variant == previous;
+                    return false;
+                }
+                return artifact != nullptr && artifact->variant != nullptr &&
+                       kernel_variant_supports(*artifact->variant, problem);
+            },
+            [this](const kernel_artifact_configuration * artifact) {
+                try {
+                    const auto start = std::chrono::steady_clock::now();
+                    std::shared_ptr<kernel_program> program;
+                    {
+                        detail::execution_gate::guard execution_guard = execution.acquire();
+                        if (device == nullptr) {
+                            device = std::make_shared<xrt::device>(info.index);
+                        }
+                        program = std::make_shared<kernel_program>(device, *artifact);
+                    }
+                    const uint64_t time_ns = elapsed_ns(start, std::chrono::steady_clock::now());
+                    GGML_LOG_INFO("ggml_xdna: resolved XRT program '%s' from %s in %.3f ms\n",
+                            artifact->variant->id, artifact->artifact_path.c_str(), time_ns / 1.0e6);
+                    return program;
+                } catch (const std::exception & e) {
+                    GGML_LOG_ERROR("ggml_xdna: failed to resolve XRT program '%s' from %s: %s\n",
+                            artifact->variant->id, artifact->artifact_path.c_str(), e.what());
+                    throw;
+                } catch (...) {
+                    GGML_LOG_ERROR("ggml_xdna: failed to resolve XRT program '%s' from %s\n",
+                            artifact->variant->id, artifact->artifact_path.c_str());
+                    throw;
+                }
+            });
+    }
+
+    device_info info;
+    // Keep the gate alive until every cached XRT object has been destroyed.
+    detail::execution_gate execution;
+    // Resolver keys point into this immutable inventory. Member order destroys the resolver first.
+    kernel_configuration configuration;
+    detail::lazy_cache<const kernel_artifact_configuration *, kernel_program> programs;
+    std::shared_ptr<xrt::device> device;
+};
+
+program_cache::program_cache(const device_info & info, kernel_configuration configuration) :
+    pimpl(std::make_unique<impl>(info, std::move(configuration))) {}
+
+program_cache::~program_cache() = default;
+
+const device_info & program_cache::info() const noexcept {
+    return pimpl->info;
+}
+
+bool program_cache::inventory_available() const noexcept {
+    return pimpl->configuration.available;
+}
+
+bool program_cache::program_available() const noexcept {
+    try {
+        const detail::lazy_cache_counts counts = pimpl->programs.counts();
+        return counts.ready != 0 || counts.untried != 0;
+    } catch (...) {
+        return false;
+    }
+}
+
+std::string program_cache::status() const {
+    const detail::lazy_cache_counts counts = pimpl->programs.counts();
+    std::ostringstream status;
+    status << pimpl->configuration.status;
+    if (pimpl->configuration.available) {
+        status << "; XRT programs ready=" << counts.ready
+               << " untried=" << counts.untried
+               << " failed=" << counts.failed;
+        const auto failures = pimpl->programs.failures();
+        for (const auto & failure : failures) {
+            const char * id = failure.first == nullptr || failure.first->variant == nullptr ?
+                "unknown" : failure.first->variant->id;
+            status << "; " << id << ": " << failure.second;
         }
     }
+    return status.str();
+}
+
+const xdna_kernel_variant * program_cache::resolve_variant(const xdna_problem & problem) noexcept {
+    std::shared_ptr<kernel_program> program = resolve_program(problem);
+    return program == nullptr ? nullptr : program->variant;
+}
+
+std::shared_ptr<kernel_program> program_cache::resolve_program(const xdna_problem & problem) noexcept {
+    return resolve_program_after(problem, nullptr);
+}
+
+std::shared_ptr<kernel_program> program_cache::resolve_program_after(
+        const xdna_problem & problem,
+        const kernel_program * previous) noexcept {
+    try {
+        // Each artifact has one process-static registry descriptor. Use its
+        // identity as the ordered cursor instead of an inventory address.
+        return pimpl->resolve(problem, previous == nullptr ? nullptr : previous->variant);
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml_xdna: XDNA program cache resolution failed: %s\n", e.what());
+    } catch (...) {
+        GGML_LOG_ERROR("ggml_xdna: XDNA program cache resolution failed with an unknown error\n");
+    }
     return nullptr;
+}
+
+detail::execution_gate::guard program_cache::acquire_execution() {
+    return pimpl->execution.acquire();
 }
 
 struct runtime::impl {
@@ -478,35 +628,31 @@ struct runtime::impl {
     };
 
     struct kernel_state {
-        kernel_state(xrt::device & device, const kernel_artifact_configuration & configuration) :
-            variant(configuration.variant) {
-            if (configuration.variant == nullptr) {
-                throw std::runtime_error("XDNA kernel configuration has no selected variant");
-            }
-            const xdna_kernel_variant & selected = *configuration.variant;
-            xclbin = std::make_unique<xrt::xclbin>(configuration.xclbin_data);
-            device.register_xclbin(*xclbin);
-            context = std::make_unique<xrt::hw_context>(device, xclbin->get_uuid());
-            kernel = std::make_unique<xrt::kernel>(*context, selected.xrt_kernel_name);
-            instructions = configuration.instructions;
+        explicit kernel_state(std::shared_ptr<kernel_program> program_value) :
+            program(std::move(program_value)), variant(program->variant) {
+            const xdna_kernel_variant & selected = *variant;
+            xrt::device & device = *program->device;
 
             instruction_bo = std::make_unique<xrt::bo>(
-                device, instructions.size() * sizeof(uint32_t), XCL_BO_FLAGS_CACHEABLE, kernel->group_id(1));
-            std::memcpy(instruction_bo->map<void *>(), instructions.data(), instructions.size() * sizeof(uint32_t));
+                device, program->instructions.size() * sizeof(uint32_t), XCL_BO_FLAGS_CACHEABLE,
+                program->kernel->group_id(1));
+            std::memcpy(
+                instruction_bo->map<void *>(), program->instructions.data(),
+                program->instructions.size() * sizeof(uint32_t));
             const auto instruction_sync_start = std::chrono::steady_clock::now();
             instruction_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
             instruction_sync_time_ns = elapsed_ns(instruction_sync_start, std::chrono::steady_clock::now());
 
             activation_bo = std::make_unique<xrt::bo>(
-                device, selected.device_activation_bytes, xrt::bo::flags::host_only, kernel->group_id(4));
+                device, selected.device_activation_bytes, xrt::bo::flags::host_only, program->kernel->group_id(4));
             activation_data = activation_bo->map<void *>();
             output_bo = std::make_unique<xrt::bo>(
-                device, selected.device_output_bytes, xrt::bo::flags::host_only, kernel->group_id(5));
+                device, selected.device_output_bytes, xrt::bo::flags::host_only, program->kernel->group_id(5));
             output_data = output_bo->map<void *>();
             temporary_bo = std::make_unique<xrt::bo>(
-                device, 1, xrt::bo::flags::host_only, kernel->group_id(6));
+                device, 1, xrt::bo::flags::host_only, program->kernel->group_id(6));
             trace_bo = std::make_unique<xrt::bo>(
-                device, 1, xrt::bo::flags::host_only, kernel->group_id(7));
+                device, 1, xrt::bo::flags::host_only, program->kernel->group_id(7));
 
             ensure_run();
         }
@@ -516,10 +662,10 @@ struct runtime::impl {
                 return;
             }
 
-            auto new_run = std::make_unique<xrt::run>(*kernel);
+            auto new_run = std::make_unique<xrt::run>(*program->kernel);
             new_run->set_arg(0, variant->runtime_opcode);
             new_run->set_arg(1, *instruction_bo);
-            new_run->set_arg(2, instructions.size());
+            new_run->set_arg(2, program->instructions.size());
             new_run->set_arg(4, *activation_bo);
             new_run->set_arg(5, *output_bo);
             new_run->set_arg(6, *temporary_bo);
@@ -551,11 +697,8 @@ struct runtime::impl {
             reset_run();
         }
 
+        std::shared_ptr<kernel_program> program;
         const xdna_kernel_variant * variant = nullptr;
-        std::unique_ptr<xrt::xclbin> xclbin;
-        std::unique_ptr<xrt::hw_context> context;
-        std::unique_ptr<xrt::kernel> kernel;
-        std::vector<uint32_t> instructions;
         std::unique_ptr<xrt::bo> instruction_bo;
         std::unique_ptr<xrt::bo> activation_bo;
         std::unique_ptr<xrt::bo> output_bo;
@@ -570,57 +713,10 @@ struct runtime::impl {
         uint64_t instruction_sync_time_ns = 0;
     };
 
-    impl(device_info value, const kernel_configuration & configuration) :
-        info(std::move(value)), device(info.index), kernel_status(configuration.status) {
-        if (!configuration.available) {
-            return;
+    explicit impl(std::shared_ptr<program_cache> programs_value) : programs(std::move(programs_value)) {
+        if (programs == nullptr) {
+            throw std::runtime_error("XDNA runtime has no device program cache");
         }
-
-        std::vector<std::string> loaded;
-        std::vector<std::string> failures;
-        for (const kernel_artifact_configuration & artifact : configuration.artifacts) {
-            try {
-                auto state = std::make_unique<kernel_state>(device, artifact);
-                const xdna_kernel_variant & variant = *state->variant;
-                explicit_bo_creations.fetch_add(5);
-                explicit_bo_creation_bytes.fetch_add(
-                    state->instructions.size() * sizeof(uint32_t) + variant.device_activation_bytes +
-                    variant.device_output_bytes + 2);
-                sync_to_device_calls.fetch_add(1);
-                sync_to_device_bytes.fetch_add(state->instructions.size() * sizeof(uint32_t));
-                sync_to_device_time_ns.fetch_add(state->instruction_sync_time_ns);
-                loaded.emplace_back(std::string(variant.id) + "=" + artifact.artifact_path);
-                states.emplace_back(std::move(state));
-            } catch (const std::exception & e) {
-                const char * id = artifact.variant == nullptr ? "unknown" : artifact.variant->id;
-                failures.emplace_back(std::string(id) + ": " + e.what());
-            } catch (...) {
-                const char * id = artifact.variant == nullptr ? "unknown" : artifact.variant->id;
-                failures.emplace_back(std::string(id) + ": unknown XRT kernel load failure");
-            }
-        }
-
-        std::ostringstream status;
-        if (!failures.empty()) {
-            // Device capability reporting is based on the complete validated
-            // configuration.  Do not retain a partial runtime that would
-            // advertise a variant whose XRT state failed to load.
-            states.clear();
-            status << configuration.status << "; XDNA kernel artifact load failed";
-            for (const std::string & failure : failures) {
-                status << "; " << failure;
-            }
-        } else {
-            status << configuration.status << " (loaded ";
-            for (size_t i = 0; i < loaded.size(); ++i) {
-                if (i != 0) {
-                    status << "; ";
-                }
-                status << loaded[i];
-            }
-            status << ')';
-        }
-        kernel_status = status.str();
     }
 
     ~impl() {
@@ -633,11 +729,16 @@ struct runtime::impl {
             ggml_backend_buffer_remove_free_observer(observer.handle);
         }
         owner_observers.clear();
-        for (const auto & state : states) {
-            state->reset_run();
+        const std::vector<std::shared_ptr<kernel_state>> ready_states = states.ready_values();
+        {
+            detail::execution_gate::guard execution_guard = programs->acquire_execution();
+            for (const auto & state : ready_states) {
+                state->reset_run();
+            }
         }
         weights.clear();
         roots.clear();
+        states.clear();
     }
 
     static void on_owner_buffer_free(ggml_backend_buffer_t buffer, void * user_data) noexcept {
@@ -649,9 +750,13 @@ struct runtime::impl {
         // command-BO bindings and tensor-specific child views before the
         // parent userptr registrations while the buffer provider still keeps
         // the host allocation alive.
-        for (const auto & state : self->states) {
-            if (state->bound_weight_owner == buffer) {
-                state->reset_run();
+        const std::vector<std::shared_ptr<kernel_state>> ready_states = self->states.ready_values();
+        {
+            detail::execution_gate::guard execution_guard = self->programs->acquire_execution();
+            for (const auto & state : ready_states) {
+                if (state->bound_weight_owner == buffer) {
+                    state->reset_run();
+                }
             }
         }
         self->weights.erase(
@@ -692,20 +797,50 @@ struct runtime::impl {
         }
     }
 
-    const kernel_state * select_state(const xdna_problem & problem) const noexcept {
-        for (const auto & state : states) {
-            if (state->variant != nullptr && kernel_variant_supports(*state->variant, problem)) {
-                return state.get();
+    std::shared_ptr<kernel_state> select_state(const xdna_problem & problem) {
+        std::shared_ptr<kernel_program> previous;
+        while (true) {
+            std::shared_ptr<kernel_program> program = programs->resolve_program_after(problem, previous.get());
+            if (program == nullptr) {
+                return nullptr;
             }
+
+            std::shared_ptr<kernel_state> state = states.resolve_or_add(
+                program,
+                [this](const std::shared_ptr<kernel_program> & selected) {
+                    try {
+                        std::shared_ptr<kernel_state> state;
+                        {
+                            detail::execution_gate::guard execution_guard = programs->acquire_execution();
+                            state = std::make_shared<kernel_state>(selected);
+                        }
+                        const xdna_kernel_variant & variant = *state->variant;
+                        explicit_bo_creations.fetch_add(5);
+                        explicit_bo_creation_bytes.fetch_add(
+                            selected->instructions.size() * sizeof(uint32_t) + variant.device_activation_bytes +
+                            variant.device_output_bytes + 2);
+                        sync_to_device_calls.fetch_add(1);
+                        sync_to_device_bytes.fetch_add(selected->instructions.size() * sizeof(uint32_t));
+                        sync_to_device_time_ns.fetch_add(state->instruction_sync_time_ns);
+                        return state;
+                    } catch (const std::exception & e) {
+                        GGML_LOG_ERROR("ggml_xdna: failed to create backend execution state for '%s': %s\n",
+                                selected->variant->id, e.what());
+                        throw;
+                    } catch (...) {
+                        GGML_LOG_ERROR("ggml_xdna: failed to create backend execution state for '%s'\n",
+                                selected->variant->id);
+                        throw;
+                    }
+                });
+            if (state != nullptr) {
+                return state;
+            }
+            previous = std::move(program);
         }
-        return nullptr;
     }
 
-    kernel_state * select_state(const xdna_problem & problem) noexcept {
-        return const_cast<kernel_state *>(std::as_const(*this).select_state(problem));
-    }
-
-    root_registration & register_root(const ggml_tensor * tensor) {
+    root_registration & register_root(xrt::device & device, const ggml_tensor * tensor) {
         const host_buffer_span wanted = get_host_buffer_span(tensor);
         for (auto & root : roots) {
             const auto & current = root->span;
@@ -756,7 +891,7 @@ struct runtime::impl {
         sync_to_device_time_ns.fetch_add(sync_ns);
     }
 
-    xrt::bo & register_weight(const ggml_tensor * tensor) {
+    xrt::bo & register_weight(xrt::device & device, const ggml_tensor * tensor) {
         for (auto & weight : weights) {
             if (weight->owner == tensor->buffer && weight->data == tensor->data &&
                     weight->bytes == ggml_nbytes(tensor)) {
@@ -765,7 +900,7 @@ struct runtime::impl {
             }
         }
 
-        root_registration & root = register_root(tensor);
+        root_registration & root = register_root(device, tensor);
         auto weight = std::make_unique<weight_view>(root, tensor);
         sync_weight(*weight);
         weight_registrations.fetch_add(1);
@@ -785,7 +920,7 @@ struct runtime::impl {
 
         if (ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
             *copied_bytes = 0;
-            return register_weight(tensor);
+            return register_weight(*kernel.program->device, tensor);
         }
 
         // Capability queries happen before allocation in several GGML tools,
@@ -797,7 +932,7 @@ struct runtime::impl {
         const size_t bytes = ggml_nbytes(tensor);
         if (kernel.mutable_weight_bo == nullptr) {
             auto mutable_weight_bo = std::make_unique<xrt::bo>(
-                device, bytes, xrt::bo::flags::host_only, kernel.kernel->group_id(3));
+                *kernel.program->device, bytes, xrt::bo::flags::host_only, kernel.program->kernel->group_id(3));
             void * mutable_weight_data = mutable_weight_bo->map<void *>();
             kernel.mutable_weight_data = mutable_weight_data;
             kernel.mutable_weight_bo = std::move(mutable_weight_bo);
@@ -828,10 +963,26 @@ struct runtime::impl {
         return *kernel.mutable_weight_bo;
     }
 
-    device_info info;
-    xrt::device device;
-    std::string kernel_status;
-    std::vector<std::unique_ptr<kernel_state>> states;
+    std::string status() const {
+        std::ostringstream result;
+        result << programs->status();
+        const detail::lazy_cache_counts counts = states.counts();
+        if (counts.untried != 0 || counts.ready != 0 || counts.failed != 0) {
+            result << "; backend execution states ready=" << counts.ready
+                   << " untried=" << counts.untried
+                   << " failed=" << counts.failed;
+            const auto failures = states.failures();
+            for (const auto & failure : failures) {
+                const char * id = failure.first == nullptr || failure.first->variant == nullptr ?
+                    "unknown" : failure.first->variant->id;
+                result << "; " << id << ": " << failure.second;
+            }
+        }
+        return result.str();
+    }
+
+    std::shared_ptr<program_cache> programs;
+    detail::lazy_cache<std::shared_ptr<kernel_program>, kernel_state> states;
     std::vector<std::unique_ptr<root_registration>> roots;
     std::vector<std::unique_ptr<weight_view>> weights;
     std::vector<owner_observer> owner_observers;
@@ -887,24 +1038,24 @@ struct runtime::impl {
     std::atomic<uint64_t> output_copy_time_ns { 0 };
 };
 
-runtime::runtime(const device_info & info, const kernel_configuration & configuration) {
+runtime::runtime(std::shared_ptr<program_cache> programs) {
     const auto initialization_start = std::chrono::steady_clock::now();
-    pimpl = std::make_unique<impl>(info, configuration);
+    pimpl = std::make_unique<impl>(std::move(programs));
     pimpl->initialization_time_ns.store(elapsed_ns(initialization_start, std::chrono::steady_clock::now()));
 }
 
 runtime::~runtime() = default;
 
 const device_info & runtime::info() const noexcept {
-    return pimpl->info;
+    return pimpl->programs->info();
 }
 
 bool runtime::kernel_available() const noexcept {
-    return !pimpl->states.empty();
+    return pimpl->programs->program_available();
 }
 
-const std::string & runtime::kernel_status() const noexcept {
-    return pimpl->kernel_status;
+std::string runtime::kernel_status() const {
+    return pimpl->status();
 }
 
 bool runtime::supports_op(const ggml_tensor * op) const noexcept {
@@ -912,24 +1063,24 @@ bool runtime::supports_op(const ggml_tensor * op) const noexcept {
         return false;
     }
     xdna_problem problem;
-    if (!problem_from_ggml(op, pimpl->info.arch, &problem)) {
+    if (!problem_from_ggml(op, info().arch, &problem)) {
         return false;
     }
-    return pimpl->select_state(problem) != nullptr;
+    return pimpl->programs->resolve_program(problem) != nullptr;
 }
 
 int runtime::compute(ggml_tensor * op) noexcept {
     xdna_problem problem;
-    if (!problem_from_ggml(op, pimpl->info.arch, &problem)) {
+    if (!problem_from_ggml(op, info().arch, &problem)) {
         return -1;
     }
 
     const auto total_start = std::chrono::steady_clock::now();
     try {
-        // One persistent command BO/run is intentionally reused. Serialize it
-        // until a future implementation provisions a bounded run pool.
+        // One persistent command BO/run is intentionally reused per backend.
         const std::lock_guard<std::mutex> lock(pimpl->compute_mutex);
-        impl::kernel_state * kernel = pimpl->select_state(problem);
+        std::shared_ptr<impl::kernel_state> execution_state = pimpl->select_state(problem);
+        impl::kernel_state * kernel = execution_state.get();
         if (kernel == nullptr || kernel->variant == nullptr) {
             return -1;
         }
@@ -971,10 +1122,11 @@ int runtime::compute(ggml_tensor * op) noexcept {
         pimpl->sync_to_device_time_ns.fetch_add(activation_sync_ns);
         host_memory_fence();
 
-        kernel->ensure_run();
         kernel->bound_weight_owner =
             ggml_backend_buffer_get_usage(op->src[0]->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS ?
                 op->src[0]->buffer : nullptr;
+        detail::execution_gate::guard execution_guard = pimpl->programs->acquire_execution();
+        kernel->ensure_run();
         try {
             kernel->run->set_arg(3, weight_bo);
         } catch (...) {
@@ -1018,6 +1170,7 @@ int runtime::compute(ggml_tensor * op) noexcept {
             kernel->reset_run();
             return -1;
         }
+        execution_guard.unlock();
 
         const auto output_sync_start = std::chrono::steady_clock::now();
         kernel->output_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE, variant.device_output_bytes, 0);

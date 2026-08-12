@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml-xdna.h"
+#include "xdna-lazy-cache.h"
 #include "xdna-kernel-registry.h"
 
 #include <cstddef>
@@ -33,9 +34,8 @@ struct kernel_artifact_configuration {
     std::vector<uint32_t> instructions;
 };
 
-// The validated artifact inventory for one physical device.  Registry order
-// is selector priority and each entry owns the payload needed to construct one
-// persistent XRT kernel state.
+// The validated artifact inventory for one physical device. Registry order is
+// selector priority and each entry owns one host-validated payload.
 struct kernel_configuration {
     bool available = false;
     std::vector<kernel_artifact_configuration> artifacts;
@@ -45,13 +45,37 @@ struct kernel_configuration {
 std::vector<device_info> discover_devices(std::string * error = nullptr) noexcept;
 readonly_userptr_capability probe_readonly_userptr(const device_info & info) noexcept;
 kernel_configuration probe_kernel_configuration(const device_info & info) noexcept;
-const kernel_artifact_configuration * select_kernel_configuration(
-        const kernel_configuration & configuration,
-        const xdna_problem & problem) noexcept;
+
+struct kernel_program;
+
+class program_cache {
+public:
+    program_cache(const device_info & info, kernel_configuration configuration);
+    ~program_cache();
+
+    program_cache(const program_cache &) = delete;
+    program_cache & operator=(const program_cache &) = delete;
+
+    const device_info & info() const noexcept;
+    bool inventory_available() const noexcept;
+    bool program_available() const noexcept;
+    std::string status() const;
+
+    const xdna_kernel_variant * resolve_variant(const xdna_problem & problem) noexcept;
+    std::shared_ptr<kernel_program> resolve_program(const xdna_problem & problem) noexcept;
+    std::shared_ptr<kernel_program> resolve_program_after(
+            const xdna_problem & problem,
+            const kernel_program * previous) noexcept;
+    detail::execution_gate::guard acquire_execution();
+
+private:
+    struct impl;
+    std::unique_ptr<impl> pimpl;
+};
 
 class runtime {
 public:
-    runtime(const device_info & info, const kernel_configuration & configuration);
+    explicit runtime(std::shared_ptr<program_cache> programs);
     ~runtime();
 
     runtime(const runtime &) = delete;
@@ -59,7 +83,7 @@ public:
 
     const device_info & info() const noexcept;
     bool kernel_available() const noexcept;
-    const std::string & kernel_status() const noexcept;
+    std::string kernel_status() const;
 
     bool supports_op(const ggml_tensor * op) const noexcept;
     int compute(ggml_tensor * op) noexcept;

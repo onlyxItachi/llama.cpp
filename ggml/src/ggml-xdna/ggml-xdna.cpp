@@ -20,16 +20,15 @@ namespace {
 struct xdna_device_context {
     ggml_xdna::device_info info;
     ggml_xdna::readonly_userptr_capability readonly_userptr;
-    ggml_xdna::kernel_configuration kernel_configuration;
+    std::shared_ptr<ggml_xdna::program_cache> programs;
     bool force_offload_preference = false;
     std::string name;
     std::string description;
 };
 
 struct xdna_backend_context {
-    xdna_backend_context(
-            const ggml_xdna::device_info & info,
-            const ggml_xdna::kernel_configuration & configuration) : runtime(info, configuration) {}
+    explicit xdna_backend_context(std::shared_ptr<ggml_xdna::program_cache> programs) :
+        runtime(std::move(programs)) {}
 
     ggml_xdna::runtime runtime;
 };
@@ -206,16 +205,18 @@ static ggml_backend_t ggml_backend_xdna_device_init_backend(ggml_backend_dev_t d
 
     auto * dev_ctx = static_cast<xdna_device_context *>(dev->context);
     try {
-        auto * ctx = new xdna_backend_context(dev_ctx->info, dev_ctx->kernel_configuration);
-        if (dev_ctx->kernel_configuration.available && !ctx->runtime.kernel_available()) {
-            GGML_LOG_ERROR("ggml_xdna: failed to load configured kernel on %s: %s\n",
-                    dev_ctx->info.name.c_str(), ctx->runtime.kernel_status().c_str());
+        auto * ctx = new xdna_backend_context(dev_ctx->programs);
+        if (dev_ctx->programs->inventory_available() && !ctx->runtime.kernel_available()) {
+            const std::string status = ctx->runtime.kernel_status();
+            GGML_LOG_ERROR("ggml_xdna: no configured kernel remains usable on %s: %s\n",
+                    dev_ctx->info.name.c_str(), status.c_str());
             delete ctx;
             return nullptr;
         }
+        const std::string status = ctx->runtime.kernel_status();
         GGML_LOG_INFO("ggml_xdna: initialized %s at %s (%s); %s\n",
                 dev_ctx->info.name.c_str(), dev_ctx->info.bdf.c_str(), dev_ctx->info.architecture.c_str(),
-                ctx->runtime.kernel_status().c_str());
+                status.c_str());
         return new ggml_backend {
             /* .guid    = */ ggml_backend_xdna_guid(),
             /* .iface   = */ ggml_backend_xdna_i,
@@ -236,7 +237,7 @@ static ggml_backend_buffer_type_t ggml_backend_xdna_device_get_buffer_type(ggml_
 
 static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     auto * dev_ctx = static_cast<xdna_device_context *>(dev->context);
-    if (!dev_ctx->kernel_configuration.available) {
+    if (!dev_ctx->programs->program_available()) {
         return false;
     }
 
@@ -255,7 +256,7 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const g
     if (!ggml_xdna::problem_from_ggml(op, dev_ctx->info.arch, &problem)) {
         return false;
     }
-    return ggml_xdna::select_kernel_configuration(dev_ctx->kernel_configuration, problem) != nullptr;
+    return dev_ctx->programs->resolve_variant(problem) != nullptr;
 }
 
 static bool ggml_backend_xdna_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
@@ -295,11 +296,10 @@ static bool ggml_backend_xdna_device_offload_op(ggml_backend_dev_t dev, const gg
         return false;
     }
 
-    const auto * configuration =
-            ggml_xdna::select_kernel_configuration(dev_ctx->kernel_configuration, problem);
-    return configuration != nullptr && configuration->variant != nullptr &&
+    const ggml_xdna::xdna_kernel_variant * variant = dev_ctx->programs->resolve_variant(problem);
+    return variant != nullptr &&
            ggml_xdna::kernel_variant_prefers_offload(
-                   *configuration->variant, dev_ctx->force_offload_preference);
+                   *variant, dev_ctx->force_offload_preference);
 }
 
 static const ggml_backend_device_i ggml_backend_xdna_device_i = {
@@ -336,8 +336,9 @@ struct xdna_registry_context {
             ctx->info = std::move(info);
             const char * prefer_offload = std::getenv("GGML_XDNA_PREFER_OFFLOAD");
             ctx->force_offload_preference = prefer_offload != nullptr && std::atoi(prefer_offload) != 0;
-            ctx->kernel_configuration = ggml_xdna::probe_kernel_configuration(ctx->info);
-            if (ctx->kernel_configuration.available) {
+            ggml_xdna::kernel_configuration configuration = ggml_xdna::probe_kernel_configuration(ctx->info);
+            ctx->programs = std::make_shared<ggml_xdna::program_cache>(ctx->info, std::move(configuration));
+            if (ctx->programs->inventory_available()) {
                 ctx->readonly_userptr = ggml_xdna::probe_readonly_userptr(ctx->info);
             } else {
                 ctx->readonly_userptr.status =
@@ -352,7 +353,7 @@ struct xdna_registry_context {
             if (ctx->readonly_userptr.supported) {
                 GGML_LOG_INFO("ggml_xdna: %s read-only mmap registration enabled: %s\n",
                         ctx->name.c_str(), ctx->readonly_userptr.status.c_str());
-            } else if (!ctx->kernel_configuration.available) {
+            } else if (!ctx->programs->inventory_available()) {
                 GGML_LOG_INFO("ggml_xdna: %s read-only mmap registration disabled: %s\n",
                         ctx->name.c_str(), ctx->readonly_userptr.status.c_str());
             } else {

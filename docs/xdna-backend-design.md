@@ -295,21 +295,17 @@ likewise receives metadata from the shape-specific build instead of
 maintaining a second dtype/shape table. This is deliberately a specialization
 registry, not a universally dynamic kernel.
 
-The runtime now discovers every configured registered bundle, validates each one independently, and constructs one XCLBIN/context/kernel state per valid artifact with a normally persistent, lazily recreated run.
-Both device capability reporting and execution use the same `xdna_problem` selector.
-A physical process loaded the Q4_0 288x288, BF16 288x288 and 8192x2048, Q4_0
-512x2560 and 10240x2560, and Q8_0 9216x2560 full-array artifacts
-simultaneously and passed all six CPU-reference tests. The integrated run
-recorded six submissions, six root registrations covering 70.895 MiB, six
-one-time weight syncs, and zero weight-copy bytes. Its retained log has
-SHA-256
-`3558dd263fb259326b14e41f00669ebe6b85ba5798195a8d64c75a6fcf547f27`.
-The combined log `four-variant-quiescence.log` has SHA-256 `c27483c71049f26399f089d1b74e97e5ebdb49cd4e2c787339f9020e68df869e`.
-Together these runs prove that the installed XRT stack permits six persistent
-full-array contexts after the lifetime and run-quiescence changes; they do not
-exercise an injected `wait()` failure.
+Backend registration discovers every configured bundle and validates its complete header and payload without loading an XRT program. Each device owns one shared resolver whose entries start as `untried`. The first exact `supports_op` query constructs and retains that entry's XCLBIN, hardware context, and kernel, then marks the entry `ready` or permanently `failed`. Concurrent queries serialize this transition, and a failed entry does not invalidate other configured variants. Both device capability reporting and execution use the same `xdna_problem` selector and the same resolved program.
+
+Backend instances do not allocate per-kernel BOs or runs during initialization. The first compute for a ready program creates that backend's instruction, activation, output, temporary, trace, and persistent run state. This second lazy state is also cached, including construction failure. If multiple variants match, a local-state failure advances to the next program in registry order. It keeps mutable staging, output storage, weight registrations, statistics, and command quiescence backend-local while sharing the immutable XRT program objects across backend instances.
+
+All current artifacts own the full AIE array. One execution gate in the shared device cache therefore serializes XCLBIN/context/kernel resolution, backend-local kernel BO/run construction, and steady run creation/binding through `wait()` or error quiescence across every backend instance and artifact on that device. Host packing, registration, activation sync, and completed-output drain remain outside this gate. Teardown and owner callbacks keep the lock order backend compute mutex then shared execution gate.
+
+The resolver inventory, partial-failure fallback, failure caching, concurrent first-use behavior, shared-value lifetime, and execution gate have host-only unit coverage. A physical lazy-resolution process started with `ready=0`, `untried=6`, resolved the Q4_0 288x288, BF16 288x288 and 8192x2048, Q4_0 512x2560 and 10240x2560, and Q8_0 9216x2560 programs only as their exact tests were reached, and passed all six CPU references. It submitted six commands, created 36 explicit payload BOs totaling 74,641,360 bytes, registered six immutable weights totaling 74,317,376 bytes, and reported zero weight-copy bytes. The retained log SHA256 is `97776d1f11c1c73697383787a100bdacdb134b45785d40165d880c0972f2ca78`.
+
+A separate physical probe created two backend instances from the same registered XDNA device and therefore the same lazily resolved program cache. Both instances executed the Q4_0 288x288 CPU-reference case successfully, then were destroyed in `A -> B` and `B -> A` order in separate processes. The retained log SHA256 values are `f8ffc7ff8fe9c78a4f5f09bb5f8ccc865f27b860777d84f7bfb0baf3b2887225` and `c4fb9596ecd46137fc94afc5f11163281e705a7e66a4e617fe629225e0c5f9ef`. Together these runs validate sequential multi-artifact and shared-program backend lifetimes on the installed XRT stack; they do not claim overlapping AIE execution or exercise an injected `wait()` failure.
 UMA weight registrations remain shared across those states.
-Malformed optional bundles are rejected without hiding valid variants; an XRT load failure rejects the complete backend instance so capability reporting cannot advertise an unavailable state.
+Malformed optional bundles are rejected without hiding valid variants. An XRT load failure is cached against only the selected artifact, so its exact operation falls back while independently ready or untried variants remain available.
 
 The BF16 8192x2048 artifact also passed seven directed long-double
 CPU-reference patterns and both 1,001- and 10,001-launch stress runs in a
@@ -348,13 +344,11 @@ page-registers each selected tensor window once, uses root-derived sub-BOs,
 explicitly cache-flushes each new weight view once, reuses one command/run per
 selected artifact, and uses persistent activation/output BOs. That path
 performs no weight payload copy. Mutable test weights instead use the explicitly
-measured per-call staging path described above. The backend records XRT device/kernel
+measured per-call staging path described above. The backend records backend-local
 initialization, registration, backend-created BOs, weight and other host-copy
 time, TO/FROM sync time, separate XRT `start()` and `wait()` time, and complete
 call time. A size-aware v2 statistics API exposes those stage counters through
-dynamic backend lookup while preserving the original stats ABI. Artifact
-parsing happens during backend registration before the runtime initialization
-timer. Kernel source and reproduction instructions are in
+dynamic backend lookup while preserving the original stats ABI. Artifact parsing happens during backend registration before the runtime initialization timer. Shared XCLBIN/context/kernel construction happens during capability resolution, logs its own wall time, and is not charged to a later backend instance's initialization counter. Kernel source and reproduction instructions are in
 `ggml/src/ggml-xdna/kernels/aie2p/`.
 
 The clean-built nine-worker Q4_0 bundle used for the final physical tests is

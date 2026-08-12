@@ -50,11 +50,7 @@ export GGML_XDNA_AIE2P_Q8_0_GEMV_M9216_K2560_BUNDLE="$PWD/gemv-q8_0-m9216-k2560.
 export GGML_XDNA_AIE2P_BF16_GEMV_M8192_K2048_BUNDLE="$PWD/gemv-bf16-m8192-k2048.ggmlxdna"
 ```
 
-The runtime discovers every configured registered bundle, creates one
-persistent XRT state per artifact, and selects among them from the generic
-`xdna_problem` metadata. It is therefore valid to configure multiple shape
-specializations in one backend instance. Registry order is used only when more
-than one variant matches the same problem.
+The runtime discovers and host-validates every configured registered bundle. An exact `supports_op` query lazily resolves one shared device XRT program, and the first compute creates the backend-local BO and run state. It is therefore valid to configure multiple shape specializations in one backend instance without loading programs for shapes absent from the graph. Registry order is used only when more than one variant matches the same problem. Current full-array artifacts share one per-device XRT state and command gate across backend instances.
 
 Configured variants remain available through `supports_op`, but the current
 measured variants do not request automatic scheduler priority over an earlier
