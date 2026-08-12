@@ -12,6 +12,8 @@ namespace {
 
 constexpr size_t artifact_header_bytes = 64;
 constexpr char artifact_magic[8] = { 'G', 'G', 'X', 'D', 'N', 'A', '1', '\0' };
+constexpr uint32_t artifact_abi_v1 = 1;
+constexpr uint32_t artifact_abi_v2 = 2;
 
 uint32_t read_le32(const unsigned char * value) {
     return static_cast<uint32_t>(value[0]) |
@@ -23,6 +25,31 @@ uint32_t read_le32(const unsigned char * value) {
 uint64_t read_le64(const unsigned char * value) {
     return static_cast<uint64_t>(read_le32(value)) |
            (static_cast<uint64_t>(read_le32(value + 4)) << 32u);
+}
+
+bool artifact_architecture_matches(
+        uint32_t artifact_abi_version,
+        uint32_t architecture_id,
+        uint32_t reserved,
+        device_architecture architecture) {
+    if (reserved != 0) {
+        return false;
+    }
+    if (artifact_abi_version == artifact_abi_v1) {
+        return architecture == device_architecture::aie2p && architecture_id == 0;
+    }
+    if (artifact_abi_version != artifact_abi_v2) {
+        return false;
+    }
+    switch (architecture) {
+        case device_architecture::aie2:
+            return architecture_id == static_cast<uint32_t>(artifact_architecture_id::aie2);
+        case device_architecture::aie2p:
+            return architecture_id == static_cast<uint32_t>(artifact_architecture_id::aie2p);
+        case device_architecture::unknown:
+            return false;
+    }
+    return false;
 }
 
 } // namespace
@@ -54,7 +81,12 @@ artifact_contents read_artifact_bundle(const std::string & path, const xdna_kern
             read_le32(bytes.data() + 28) != variant.weight_bytes ||
             read_le32(bytes.data() + 32) != variant.device_activation_bytes ||
             read_le32(bytes.data() + 36) != variant.device_output_bytes ||
-            read_le64(bytes.data() + 56) != 0 || variant.n != 1) {
+            !artifact_architecture_matches(
+                variant.artifact_abi_version,
+                read_le32(bytes.data() + 56),
+                read_le32(bytes.data() + 60),
+                variant.architecture) ||
+            variant.n != 1) {
         throw std::runtime_error("XDNA artifact ABI metadata mismatch in " + path);
     }
 

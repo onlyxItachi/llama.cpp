@@ -74,6 +74,19 @@ through another dtype's variable before advertising `MUL_MAT` support. Bundles
 remain trusted executable inputs: the header does not prove that a manually
 relabeled arbitrary xclbin implements its declared contract.
 
+## Artifact architecture identity
+
+The 64-byte `GGXDNA1` container header has two supported ABI layouts. Existing AIE2P artifacts use ABI v1 unchanged: bytes 56 through 63 are zero, and the runtime accepts this legacy layout only for an AIE2P registry variant. ABI v2 assigns stable little-endian architecture IDs independently of C++ enum values:
+
+| Header bytes | ABI v1 | ABI v2 |
+| --- | --- | --- |
+| 56-59 | zero | `1` for AIE2, `2` for AIE2P |
+| 60-63 | zero | zero |
+
+ABI v2 requires an exact match between the header ID and the registry variant. Unknown IDs, unknown variant architectures, cross-generation IDs, and nonzero reserved bytes are rejected before XRT sees the payload. A future AIE2 artifact must use ABI v2; this format support does not add an AIE2 registry entry or a physical XDNA1 support claim.
+
+The packer continues to emit ABI-v1 AIE2P bundles for existing Makefile calls. ABI v2 must name both the version and architecture explicitly, for example `pack-artifact.py --abi-version 2 --architecture aie2p ...`. `--architecture aie2` with ABI v1, ABI v2 without `--architecture`, unsupported versions, and unknown architecture names fail closed.
+
 The artifact exercised during initial bring-up was built with MLIR-AIE Python
 package 1.3.4 and Peano/llvm-aie commit
 `cb664e8cc3eb42a12e3ad3cee28729785ffa97a3`. Before distributing artifacts,

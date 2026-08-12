@@ -9,6 +9,11 @@
 namespace ggml_xdna {
 namespace detail {
 
+enum class artifact_architecture_id : uint32_t {
+    aie2 = 1,
+    aie2p = 2,
+};
+
 struct artifact_contents {
     std::vector<char> xclbin_data;
     std::vector<uint32_t> instructions;

@@ -16,6 +16,8 @@ namespace {
 
 constexpr size_t header_bytes = 64;
 constexpr unsigned char magic[8] = { 'G', 'G', 'X', 'D', 'N', 'A', '1', '\0' };
+static_assert(static_cast<uint32_t>(ggml_xdna::detail::artifact_architecture_id::aie2) == 1);
+static_assert(static_cast<uint32_t>(ggml_xdna::detail::artifact_architecture_id::aie2p) == 2);
 
 void require(bool condition, const char * message) {
     if (!condition) {
@@ -71,13 +73,16 @@ void write_le64(std::vector<unsigned char> & bytes, size_t offset, uint64_t valu
     }
 }
 
-ggml_xdna::xdna_kernel_variant make_variant() {
+ggml_xdna::xdna_kernel_variant make_variant(
+        ggml_xdna::device_architecture architecture = ggml_xdna::device_architecture::aie2p,
+        uint32_t artifact_abi_version = 1) {
     ggml_xdna::xdna_kernel_variant variant = {};
+    variant.architecture = architecture;
     variant.m = 13;
     variant.n = 1;
     variant.k = 17;
     variant.artifact_kind = 7;
-    variant.artifact_abi_version = 1;
+    variant.artifact_abi_version = artifact_abi_version;
     variant.weight_bytes = 221;
     variant.device_activation_bytes = 34;
     variant.device_output_bytes = 52;
@@ -87,7 +92,8 @@ ggml_xdna::xdna_kernel_variant make_variant() {
 std::vector<unsigned char> make_bundle(
         const ggml_xdna::xdna_kernel_variant & variant,
         const std::vector<unsigned char> & xclbin,
-        const std::vector<unsigned char> & instructions) {
+        const std::vector<unsigned char> & instructions,
+        uint32_t architecture_id = 0) {
     std::vector<unsigned char> bytes(header_bytes + xclbin.size() + instructions.size(), 0);
     std::memcpy(bytes.data(), magic, sizeof(magic));
     write_le32(bytes, 8, header_bytes);
@@ -100,6 +106,7 @@ std::vector<unsigned char> make_bundle(
     write_le32(bytes, 36, static_cast<uint32_t>(variant.device_output_bytes));
     write_le64(bytes, 40, xclbin.size());
     write_le64(bytes, 48, instructions.size());
+    write_le32(bytes, 56, architecture_id);
     if (!xclbin.empty()) {
         std::memcpy(bytes.data() + header_bytes, xclbin.data(), xclbin.size());
     }
@@ -107,6 +114,20 @@ std::vector<unsigned char> make_bundle(
         std::memcpy(bytes.data() + header_bytes + xclbin.size(), instructions.data(), instructions.size());
     }
     return bytes;
+}
+
+void expect_accepted(
+        const temporary_file & file,
+        const std::vector<unsigned char> & bytes,
+        const ggml_xdna::xdna_kernel_variant & variant,
+        const char * name) {
+    file.write(bytes);
+    try {
+        (void) ggml_xdna::detail::read_artifact_bundle(file.path, variant);
+    } catch (const std::runtime_error & error) {
+        fprintf(stderr, "test-xdna-artifact: %s was rejected: %s\n", name, error.what());
+        abort();
+    }
 }
 
 void expect_rejected(
@@ -183,12 +204,78 @@ void test_header_validation(const temporary_file & file) {
     }
 
     changed = valid;
-    write_le64(changed, 56, 1);
+    write_le32(changed, 56, 1);
+    expect_rejected(file, changed, variant, "ABI metadata mismatch", "nonzero ABI v1 architecture field");
+
+    changed = valid;
+    write_le32(changed, 60, 1);
     expect_rejected(file, changed, variant, "ABI metadata mismatch", "nonzero reserved header field");
 
     ggml_xdna::xdna_kernel_variant batched = variant;
     batched.n = 2;
     expect_rejected(file, valid, batched, "ABI metadata mismatch", "unsupported N");
+}
+
+void test_architecture_validation(const temporary_file & file) {
+    const std::vector<unsigned char> xclbin { 1, 2, 3, 4, 5 };
+    const std::vector<unsigned char> instructions { 1, 0, 0, 0, 2, 0, 0, 0 };
+
+    const ggml_xdna::xdna_kernel_variant aie2_v1 =
+        make_variant(ggml_xdna::device_architecture::aie2, 1);
+    expect_rejected(
+        file, make_bundle(aie2_v1, xclbin, instructions), aie2_v1,
+        "ABI metadata mismatch", "AIE2 ABI v1");
+
+    const ggml_xdna::xdna_kernel_variant aie2_v2 =
+        make_variant(ggml_xdna::device_architecture::aie2, 2);
+    const std::vector<unsigned char> valid_aie2 =
+        make_bundle(
+            aie2_v2, xclbin, instructions,
+            static_cast<uint32_t>(ggml_xdna::detail::artifact_architecture_id::aie2));
+    expect_accepted(file, valid_aie2, aie2_v2, "AIE2 ABI v2");
+
+    const ggml_xdna::xdna_kernel_variant aie2p_v2 =
+        make_variant(ggml_xdna::device_architecture::aie2p, 2);
+    const std::vector<unsigned char> valid_aie2p =
+        make_bundle(
+            aie2p_v2, xclbin, instructions,
+            static_cast<uint32_t>(ggml_xdna::detail::artifact_architecture_id::aie2p));
+    expect_accepted(file, valid_aie2p, aie2p_v2, "AIE2P ABI v2");
+
+    expect_rejected(
+        file, valid_aie2p, aie2_v2,
+        "ABI metadata mismatch", "AIE2P artifact for AIE2 variant");
+    expect_rejected(
+        file, valid_aie2, aie2p_v2,
+        "ABI metadata mismatch", "AIE2 artifact for AIE2P variant");
+
+    std::vector<unsigned char> changed = valid_aie2;
+    write_le32(changed, 56, 0);
+    expect_rejected(file, changed, aie2_v2, "ABI metadata mismatch", "zero ABI v2 architecture id");
+
+    changed = valid_aie2;
+    write_le32(changed, 56, 3);
+    expect_rejected(file, changed, aie2_v2, "ABI metadata mismatch", "unknown ABI v2 architecture id");
+
+    changed = valid_aie2;
+    write_le32(changed, 60, 1);
+    expect_rejected(file, changed, aie2_v2, "ABI metadata mismatch", "nonzero ABI v2 reserved field");
+
+    const ggml_xdna::xdna_kernel_variant unknown_v2 =
+        make_variant(ggml_xdna::device_architecture::unknown, 2);
+    expect_rejected(
+        file, valid_aie2, unknown_v2,
+        "ABI metadata mismatch", "unknown variant architecture");
+
+    const ggml_xdna::xdna_kernel_variant unsupported_abi =
+        make_variant(ggml_xdna::device_architecture::aie2p, 3);
+    expect_rejected(
+        file,
+        make_bundle(
+            unsupported_abi, xclbin, instructions,
+            static_cast<uint32_t>(ggml_xdna::detail::artifact_architecture_id::aie2p)),
+        unsupported_abi,
+        "ABI metadata mismatch", "unsupported artifact ABI version");
 }
 
 void test_payload_validation(const temporary_file & file) {
@@ -235,6 +322,7 @@ int main() {
     temporary_file file;
     test_valid_bundle(file);
     test_header_validation(file);
+    test_architecture_validation(file);
     test_payload_validation(file);
     return 0;
 }

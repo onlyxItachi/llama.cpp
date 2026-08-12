@@ -118,8 +118,7 @@ dependencies.
 Krackan XDNA2/AIE2P in MLIR-AIE
 ([device mapping](https://github.com/Xilinx/mlir-aie/blob/a8fea363dfd63015cffd380e0679950419a0a7cd/python/aie_lit_utils/lit_config_helpers.py#L62-L67)). XRT names the present
 XDNA2 device `RyzenAI-npu4`. The backend keeps architecture discovery generic,
-but the only compute artifact currently accepted is AIE2P. XDNA1 is not claimed
-as tested.
+but the only registered and physically validated compute artifacts are AIE2P. XDNA1 has no registry entry and is not claimed as tested.
 
 FastFlowLM demonstrates persistent runtime resources, but its Q4NX layout and
 dequant/GEMM kernels are opaque prebuilt libraries, use a different packed
@@ -336,15 +335,9 @@ The configured variant accepts only its exact contract:
   `BF16[2048,8192] x F32[2048,1] -> F32[8192,1]`;
 - one AIE2P/XDNA2 device and an explicitly configured versioned artifact bundle.
 
-The bundle couples a self-identifying kernel kind, ABI version, M and K,
-weight/activation/output byte sizes, xclbin, and instruction stream; N=1 is
-enforced by the selected variant rather than encoded in ABI v1. The runtime
-parses and validates the complete bundle before `supports_op` becomes true. A
-deliberate test labeling the BF16 bundle as Q4_0 was rejected with an ABI
-metadata mismatch and zero submissions, preventing accidental cross-pairing of
-the generated bundles. The configured bundle is still a trusted executable
-input; its header does not authenticate the semantics of a manually relabeled
-arbitrary xclbin.
+The bundle couples a self-identifying kernel kind, ABI version, M and K, weight/activation/output byte sizes, architecture identity, xclbin, and instruction stream; N=1 is enforced by the selected variant rather than encoded in the artifact header. The 64-byte container keeps existing AIE2P ABI-v1 bundles compatible with bytes 56-63 reserved as zero. ABI v1 is rejected for AIE2 variants. ABI v2 stores a stable little-endian architecture ID at bytes 56-59 (`1` for AIE2 and `2` for AIE2P) and requires bytes 60-63 to remain zero. The runtime rejects unknown IDs, unknown variant architectures, and AIE2/AIE2P cross-pairing before `supports_op` becomes true. This parser and wire-format separation prepares an AIE2 boundary but does not add an AIE2 registry entry or claim XDNA1 execution.
+
+A deliberate test labeling the BF16 bundle as Q4_0 was rejected with an ABI metadata mismatch and zero submissions, preventing accidental cross-pairing of the generated bundles. The configured bundle is still a trusted executable input; its header does not authenticate the semantics of a manually relabeled arbitrary xclbin.
 
 Every prefill/batched shape and every other unregistered dtype/shape is
 rejected. The Q4_0 kernel reads the native 18-byte `block_q4_0` representation
