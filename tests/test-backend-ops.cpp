@@ -4814,6 +4814,119 @@ struct test_mul_mat_weight : public test_mul_mat {
     }
 };
 
+static uint32_t test_mix32(uint32_t value) {
+    value ^= value >> 16u;
+    value *= 0x7feb352du;
+    value ^= value >> 15u;
+    value *= 0x846ca68bu;
+    value ^= value >> 16u;
+    return value;
+}
+
+// Reproducible native-BF16 coverage for the physically validated XDNA gate/up
+// shape. One bounded dense case also carries finite BF16 encoding edge cases;
+// this keeps the ordinary backend suite from duplicating a 32 MiB weight test
+// for every directed pattern used by the standalone hardware runner.
+struct test_mul_mat_weight_bf16_deterministic : public test_mul_mat_weight {
+    using test_mul_mat_weight::test_mul_mat_weight;
+
+    static ggml_bf16_t bf16_from_bits(uint16_t bits) {
+        return { bits };
+    }
+
+    static ggml_bf16_t moderate_bf16(uint32_t key) {
+        const int numerator = static_cast<int>(key % 257u) - 128;
+        return ggml_fp32_to_bf16(static_cast<float>(numerator) / 128.0f);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        GGML_ASSERT(type_a == GGML_TYPE_BF16 && type_b == GGML_TYPE_F32 && n == 1 && k > 33);
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_BF16) {
+                GGML_ASSERT(strcmp(t->name, "a") == 0);
+                GGML_ASSERT(t->ne[0] == k && ggml_nrows(t) == m);
+
+                std::vector<ggml_bf16_t> data(ggml_nelements(t));
+                for (int64_t row = 0; row < m; ++row) {
+                    ggml_bf16_t * row_data = data.data() + row * k;
+                    for (int64_t column = 0; column < k; ++column) {
+                        const uint32_t key = test_mix32(
+                            0x5bf03635u ^ static_cast<uint32_t>(row) * 0x9e3779b9u ^
+                            static_cast<uint32_t>(column) * 0x85ebca6bu);
+                        // The activation at columns 3 and 4 is the largest
+                        // finite BF16 value. Keep these columns zero except for
+                        // the explicitly safe normal/subnormal products below.
+                        row_data[column] = column == 3 || column == 4 ?
+                            bf16_from_bits(0x0000u) : moderate_bf16(key);
+                    }
+
+                    // Make both ends of K observable in every output row.
+                    row_data[0] = bf16_from_bits((row & 1) != 0 ? 0xbf00u : 0x3f00u);
+                    row_data[k - 1] = bf16_from_bits((row & 2) != 0 ? 0xbe80u : 0x3e80u);
+
+                    // Signed zero, normal, subnormal, and largest-finite
+                    // encodings are spread over all row routes. Every extreme
+                    // product is bounded: max-finite is paired with a tiny
+                    // activation, or a tiny weight with max-finite activation.
+                    switch (row % 12) {
+                        case 0:  row_data[0]     = bf16_from_bits(0x0000u); break;
+                        case 1:  row_data[0]     = bf16_from_bits(0x8000u); break;
+                        case 2:  row_data[1]     = bf16_from_bits(0x7f7fu); break;
+                        case 3:  row_data[1]     = bf16_from_bits(0xff7fu); break;
+                        case 4:  row_data[2]     = bf16_from_bits(0x7f7fu); break;
+                        case 5:  row_data[2]     = bf16_from_bits(0xff7fu); break;
+                        case 6:  row_data[3]     = bf16_from_bits(0x0080u); break;
+                        case 7:  row_data[3]     = bf16_from_bits(0x0001u); break;
+                        case 8:  row_data[4]     = bf16_from_bits(0x0080u); break;
+                        case 9:  row_data[4]     = bf16_from_bits(0x8001u); break;
+                        case 10: row_data[k - 1] = bf16_from_bits(0x4000u); break;
+                        case 11: row_data[k - 1] = bf16_from_bits(0xc000u); break;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(ggml_bf16_t));
+                continue;
+            }
+
+            GGML_ASSERT(t->type == GGML_TYPE_F32);
+            std::vector<float> data(ggml_nelements(t));
+            for (size_t i = 0; i < data.size(); ++i) {
+                data[i] = ggml_bf16_to_fp32(moderate_bf16(test_mix32(
+                    0x8f1bbcdcu ^ static_cast<uint32_t>(i) * 0x27d4eb2du)));
+            }
+
+            if (strcmp(t->name, "b") == 0) {
+                GGML_ASSERT(data.size() == static_cast<size_t>(k));
+                const auto set_bf16 = [&](size_t index, uint16_t bits) {
+                    data[index] = ggml_bf16_to_fp32(bf16_from_bits(bits));
+                };
+                set_bf16(0,          0x3f80u); // +1, first column
+                set_bf16(1,          0x0080u); // smallest positive normal
+                set_bf16(2,          0x0001u); // smallest positive subnormal
+                set_bf16(3,          0x7f7fu); // largest positive finite
+                set_bf16(4,          0xff7fu); // largest negative finite
+                set_bf16(5,          0x0000u); // +0
+                set_bf16(6,          0x8000u); // -0
+                set_bf16(31,         0xbf80u); // -1, vector-lane boundary
+                set_bf16(32,         0x8080u); // negative smallest normal
+                set_bf16(33,         0x8001u); // negative smallest subnormal
+                set_bf16(k - 2,      0x3e80u); // +0.25
+                set_bf16(k - 1,      0xbf40u); // -0.75, final column
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+        }
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        for (size_t i = 0; i < n; ++i) {
+            if (!std::isfinite(a[i]) || !std::isfinite(b[i])) {
+                return DBL_MAX;
+            }
+        }
+        return test_mul_mat::err(a, b, n);
+    }
+};
+
 // Reproducible native-Q8_0 coverage for physically validated XDNA shapes.
 // The ordinary backend-op initializer intentionally uses random_device; this
 // version fixes every packed scale, quant, and activation value so repeated
@@ -4828,15 +4941,6 @@ struct test_mul_mat_weight_q8_0_deterministic : public test_mul_mat_weight {
 
     static_assert(sizeof(q8_0_block) == 34);
 
-    static uint32_t mix32(uint32_t value) {
-        value ^= value >> 16u;
-        value *= 0x7feb352du;
-        value ^= value >> 15u;
-        value *= 0x846ca68bu;
-        value ^= value >> 16u;
-        return value;
-    }
-
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_Q8_0) {
@@ -4850,14 +4954,14 @@ struct test_mul_mat_weight_q8_0_deterministic : public test_mul_mat_weight {
                 };
                 for (size_t ib = 0; ib < blocks.size(); ++ib) {
                     const uint64_t ib64 = static_cast<uint64_t>(ib);
-                    const uint32_t key = mix32(
+                    const uint32_t key = test_mix32(
                         0x12345678u ^ static_cast<uint32_t>(ib) * 0x9e3779b9u ^
                         static_cast<uint32_t>(ib64 >> 32));
                     const float scale = ib + 1 == blocks.size() ? -4.0f : scale_cases[key & 7u];
                     blocks[ib].d = ggml_fp32_to_fp16(scale);
                     for (size_t iq = 0; iq < 32; ++iq) {
                         const int32_t signed_value =
-                            static_cast<int32_t>(mix32(key + static_cast<uint32_t>(iq)) & 0xffu) - 128;
+                            static_cast<int32_t>(test_mix32(key + static_cast<uint32_t>(iq)) & 0xffu) - 128;
                         int8_t quant = static_cast<int8_t>(signed_value);
                         if (iq == 0) {
                             quant = -128;
@@ -4878,7 +4982,7 @@ struct test_mul_mat_weight_q8_0_deterministic : public test_mul_mat_weight {
             std::vector<float> data(ggml_nelements(t));
             for (size_t i = 0; i < data.size(); ++i) {
                 const uint64_t i64 = static_cast<uint64_t>(i);
-                const uint32_t value = mix32(
+                const uint32_t value = test_mix32(
                     (0x12345678u + static_cast<uint32_t>(i) * 0x27d4eb2du) ^
                     static_cast<uint32_t>(i64 >> 32));
                 data[i] = (static_cast<int32_t>(value & 0xffffu) - 32768) / 32768.0f;
@@ -9718,7 +9822,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_Q4_0, GGML_TYPE_F32, 288, 1, 288, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_BF16, GGML_TYPE_F32, 288, 1, 288, {1, 1}, {1, 1}));
     // Llama 3.2 1B gate/up projection shape used by ggml-xdna.
-    test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_BF16, GGML_TYPE_F32, 8192, 1, 2048, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_weight_bf16_deterministic(GGML_TYPE_BF16, GGML_TYPE_F32, 8192, 1, 2048, {1, 1}, {1, 1}));
     // Gemma 4 E4B sliding-window K/V projection shape used by ggml-xdna.
     test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_Q4_0, GGML_TYPE_F32, 512, 1, 2560, {1, 1}, {1, 1}));
     // Gemma 4 E4B gate/up projection shape used by ggml-xdna.
@@ -10939,7 +11043,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 1, 16416, {8,  1}, {4, 1}, {0, 1, 2, 3}, 2*16416));
     test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_Q4_0, GGML_TYPE_F32, 288, 1, 288, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_BF16, GGML_TYPE_F32, 288, 1, 288, {1, 1}, {1, 1}));
-    test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_BF16, GGML_TYPE_F32, 8192, 1, 2048, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_weight_bf16_deterministic(GGML_TYPE_BF16, GGML_TYPE_F32, 8192, 1, 2048, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_Q4_0, GGML_TYPE_F32, 512, 1, 2560, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_Q4_0, GGML_TYPE_F32, 10240, 1, 2560, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_weight_q8_0_deterministic(GGML_TYPE_Q8_0, GGML_TYPE_F32, 9216, 1, 2560, {1, 1}, {1, 1}));
