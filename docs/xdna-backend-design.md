@@ -858,7 +858,27 @@ only for the registered Llama 1B BF16 and Qwen 4B Q8_0 shapes. A2/B require
 order-balanced throughput and placement parity; C additionally requires
 nonzero XDNA submissions, zero repeated immutable-weight payload copies, and a
 CPU-reference sanity pass. Llama 3B and Qwen 9B must reject C until matching
-tracked kernels exist. None of A2, B, or C is claimed complete here.
+tracked kernels exist.
+
+A swap-guarded first A2/B pass completed six functional correctness/placement
+cells before host pressure invalidated further timing work. Llama 1B completed
+F16 and Q4_0 K/V in both A2 and B; Llama 3B completed F16 K/V in both. All six
+generated coherent deterministic output, retained ROCm Flash Attention, and
+exited successfully. The B scheduler census assigned zero compute nodes to
+XDNA: Llama 1B used 246 ROCm plus 64 CPU nodes for F16 and 310 ROCm plus 64 CPU
+nodes for Q4_0, while Llama 3B F16 used 426 ROCm plus 112 CPU nodes. Every
+`MUL_MAT` stayed on ROCm, XDNA reported zero submissions and zero weight-copy
+bytes, and `GGML_XDNA_PREFER_OFFLOAD` was explicitly unset. This confirms the
+automatic no-preference policy on the completed real graphs; it is not an
+end-to-end performance result.
+
+The run stopped before Llama 3B Q4_0 after its F16 cells incurred 2.4-124.7 MiB
+swap-in and 31.3-635.8 MiB swap-out per stage. All Qwen A2/B cells and all
+sixteen planned A2/B benchmarks therefore remain unrun, as do the forced-C
+cells. The retained partial report has SHA-256
+`200214a5f9bb3e0136c889c90f73ac311d6f1e189e947e0dbd594532fd88842a`.
+Single correctness-smoke rates are deliberately excluded from the performance
+table because cache state and host paging differed between profiles.
 
 ## Native Q4_K research frontier
 
@@ -1013,7 +1033,7 @@ AIE2 requires its own implementation and is not inferred from the tested AIE2P k
 | Reuse without per-token weight copy? | **GO for serialized immutable-buffer lifetimes**: persistent parent/view/run reuse has zero weight-copy bytes, and observer-driven eviction passes exact owner/base/data ABA reuse with two registrations and no hits. Mutable/test weights use one explicit native-byte staging copy per call. Concurrent compute/free/backend teardown is not claimed. |
 | Ordinary read-only GGUF mmap? | **NO on the installed driver, fail-closed automatically**: the complete file-backed `PROT_READ` parent/subview/sync probe fails with errno 12, leaving `mmap_support` and `CPU_Mapped` acceptance disabled. Upstream driver commit `ed8fb2dd172bde623d7112a1bd674fc0e3c4cae4` contains the required read-only pin/IOMMU path; only a successful post-upgrade runtime probe enables the positive path, which is not physically validated here. |
 | Fixed batch-one GEMV? | **GO for native 288x288, 512x2560, and 10240x2560 Q4_0, native 9216x2560 Q8_0, plus 288x288 and 8192x2048 BF16**. All six tracked variants pass together in one physical backend instance, and the BF16 production shape independently passes a 10,001-launch stress run. Q4_0 reaches 6.91/19.25 GB/s, Q8_0 reaches 31.55 GB/s, and BF16 reaches 46.52 GB/s without repacking or a secondary immutable-weight copy. The cache-only Q4_K row-batched kernel is correctness GO but integration NO-GO at 16.052 GB/s and 5.229x slower than its matched HIP control. Broader dtype/shape coverage remains open. |
-| Four-model real-GGUF inference matrix? | **GO for the 16-cell ROCm-resident A1 correctness, placement, pp512, and tg128 reference; OPEN for A2/B/C.** All requested exact files and four same-type KV modes completed with Flash Attention. A2 shared-host HIP, automatic hybrid B, and forced exact-shape C remain separate required gates. TTFT, per-node HIP counts, utilization, and energy were not measured. |
+| Four-model real-GGUF inference matrix? | **GO for the 16-cell ROCm-resident A1 correctness, placement, pp512, and tg128 reference; PARTIAL functional GO for six A2/B cells; OPEN for comparative A2/B performance and C.** All requested exact files and four same-type KV modes completed A1 with Flash Attention. Completed A2/B real graphs kept every `MUL_MAT` on ROCm and recorded zero XDNA submissions/copies under automatic policy. Host-global swap stopped the matrix before Llama 3B Q4_0, both Qwen models, every A2/B benchmark, and forced C. TTFT, utilization, energy, and full-matrix HIP node counts remain unmeasured. |
 | ROCm comparison and hybrid value? | **Capability scheduling, shared weights, and a real small-GGUF hybrid graph GO; performance NO-GO for the measured isolated shapes.** The physical pre-policy path kept `pp32` off XDNA and executed 48 XDNA projections for `tg2` from one `ROCm_Host` model allocation, with persistent page-window registrations and zero immutable-weight copy. Current normal `[ROCm,XDNA,CPU]` order leaves mutually supported decode on ROCm; `GGML_XDNA_PREFER_OFFLOAD=1` is the explicit control for reproducing intentional XDNA placement. Fair synchronized HIP is about 4.4-5.0x faster at Q4_0 512x2560, 4.7-4.9x at Q4_0 10240x2560, 2.94x at Q8_0 9216x2560, 1.84-1.86x at BF16 8192x2048, and 5.229x at cache-only Q4_K 12288x4096; HIP is about 12x faster at Q4_0 288x288. The larger native-BF16 shape narrows the gap materially but does not reverse it. All tracked production descriptors therefore keep `prefer_for_offload=false`. Fused K/V saves one XDNA command floor but remains slower than HIP, and the tested gate/up pair is slower than two optimized XDNA calls. No end-to-end hybrid performance win is claimed. |
 | NPU utilization and energy? | **OPEN**: installed XRT/sysfs exposes neither a per-kernel utilization/energy counter nor estimated NPU power (`Estimated Power: N/A`); external SoC telemetry is required. |
 
