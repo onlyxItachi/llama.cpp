@@ -788,6 +788,118 @@ build/bin/test-backend-ops test -b XDNA0 -o MUL_MAT \
   -p 'type_a=q4_0,type_b=f32,m=288,n=1,k=288'
 ```
 
+## Four-model ROCm reference and KV-cache matrix
+
+The end-to-end baseline now covers the exact four-file model matrix below. All
+files were read from their Hugging Face cache snapshots and independently
+matched the immutable LFS size and SHA-256; no alternate quantization was
+substituted.
+
+| Model repository and revision | Exact file | Bytes | SHA-256 |
+| --- | --- | ---: | --- |
+| `unsloth/Llama-3.2-1B-Instruct-GGUF@b69aef112e9f895e6f98d7ae0949f72ff09aa401` | `Llama-3.2-1B-Instruct-BF16.gguf` | 2,479,595,264 | `f5d05e90d179fa27c01a049be1574a0201bdc09ba0b345eb85e1dbf3b87610f3` |
+| `unsloth/Llama-3.2-3B-Instruct-GGUF@e7d0997e49c9cb00d88b4c1a6a16aa894b0bbc31` | `Llama-3.2-3B-Instruct-BF16.gguf` | 6,433,687,744 | `9b8dce13b6cbcd8b20037bd6383ee8e747b5034ca32f40b5b8ee2efa9ebf56b8` |
+| `unsloth/Qwen3.5-4B-GGUF@e87f176479d0855a907a41277aca2f8ee7a09523` | `Qwen3.5-4B-Q8_0.gguf` | 4,482,403,488 | `10cc391b403021dd11c614679d2fd92f611c3681d29e29651b717316965d61e1` |
+| `unsloth/Qwen3.5-9B-GGUF@3885219b6810b007914f3a7950a8d1b469d598a5` | `Qwen3.5-9B-Q4_K_M.gguf` | 5,680,522,464 | `03b74727a860a56338e042c4420bb3f04b2fec5734175f4cb9fa853daf52b7e8` |
+
+The A1 control isolated ROCm and CPU plugins; XDNA was not loaded. Every cell
+used context 2,048, `pp512`, `tg128`, batch/ubatch 512/512, 12 threads, three
+benchmark repetitions, same-type K/V, Flash Attention enabled, and ROCm0
+resident-fit with a 768 MiB margin. Each configuration first passed a fixed,
+deterministic 128-token generation sanity gate and a graph-placement gate.
+Values below are mean prompt/decode tokens per second; the parenthesized value
+is the sample standard deviation.
+
+| Model (weight type) | F16 K/V, pp / tg | BF16 K/V, pp / tg | Q8_0 K/V, pp / tg | Q4_0 K/V, pp / tg |
+| --- | ---: | ---: | ---: | ---: |
+| Llama 3.2 1B (BF16) | 2535.754 (115.019) / 35.570 (0.852) | 2353.492 (518.048) / 34.948 (0.517) | 2374.220 (490.327) / 35.712 (0.944) | 2284.177 (629.483) / 35.448 (1.056) |
+| Llama 3.2 3B (BF16) | 1010.482 (103.455) / 13.357 (0.167) | 1036.403 (111.176) / 13.185 (0.086) | 1084.211 (56.175) / 13.749 (0.079) | 1027.002 (89.202) / 13.714 (0.089) |
+| Qwen3.5 4B (Q8_0) | 530.053 (6.695) / 17.561 (0.113) | 510.584 (7.472) / 17.289 (0.074) | 521.133 (3.431) / 17.516 (0.523) | 506.150 (11.912) / 17.306 (0.099) |
+| Qwen3.5 9B (Q4_K_M mixed) | 423.394 (4.438) / 14.863 (0.147) | 421.661 (6.212) / 14.866 (0.064) | 413.127 (5.463) / 14.888 (0.107) | 429.201 (2.805) / 14.651 (0.023) |
+
+All 16 outputs were coherent and finite. Llama 1B BF16 K/V was byte-identical
+to its F16 reference; the other lower-precision outputs had sane wording
+differences. This is a functional gate, not a quality-equivalence result. No KV
+format produced a robust short-context decode-speed advantage. Llama 1B prompt
+samples were noisy, while the Llama 3B F16/BF16 and Qwen 9B F16 cells recorded
+material host-global swap-out. Those rows remain valid for correctness and
+placement but cannot establish a fine-grained precision ranking. The matrix is
+internally build-stable within each model, not a single-binary certification
+across all four models.
+
+The expected context-2,048 state payload explains the useful tradeoff. These
+figures exclude weights, allocator padding, compute buffers, and driver state;
+they are not measured total memory.
+
+| Model | F16/BF16 attention K+V | Q8_0 attention K+V | Q4_0 attention K+V | Fixed F32 recurrent state |
+| --- | ---: | ---: | ---: | ---: |
+| Llama 3.2 1B | 64 MiB | 34 MiB | 18 MiB | 0 |
+| Llama 3.2 3B | 224 MiB | 119 MiB | 63 MiB | 0 |
+| Qwen3.5 4B | 64 MiB | 34 MiB | 18 MiB | about 50.25 MiB |
+| Qwen3.5 9B | 64 MiB | 34 MiB | 18 MiB | about 50.25 MiB |
+
+Q8_0 and Q4_0 reduce attention-KV payload by 46.9% and 71.9% relative to
+F16/BF16. The Qwen values must additionally include the fixed recurrent state
+for 24 recurrent layers, so their combined reductions are 26.3% and 40.3%.
+All graph probes retained ROCm Flash Attention. XDNA node count is zero because
+the plugin was absent, not because a node-level scheduler census was collected;
+HIP node counts were not recorded. TTFT, sampled CPU/GPU/NPU utilization, and
+power or energy per token were also not measured and remain `N/A`.
+
+The frozen aggregate report has SHA-256
+`be2d9ad49d7c3a7d45dccea405c8f0e67f2da81138b986de13f387eb379b3de6`;
+its 16-row, 72-column TSV has SHA-256
+`3bb917ed316cb382fe11301e35c336946e497a8631bb4d13012b47586e8f6af1`.
+The next execution gates remain separate datasets: A2 measures identical HIP
+execution with shared host placement, B enables XDNA with the automatic policy
+and is expected to retain zero XDNA submissions because every measured
+descriptor currently declines preference, and C forces exact XDNA placement
+only for the registered Llama 1B BF16 and Qwen 4B Q8_0 shapes. A2/B require
+order-balanced throughput and placement parity; C additionally requires
+nonzero XDNA submissions, zero repeated immutable-weight payload copies, and a
+CPU-reference sanity pass. Llama 3B and Qwen 9B must reject C until matching
+tracked kernels exist. None of A2, B, or C is claimed complete here.
+
+## Native Q4_K research frontier
+
+A cache-only AIE2P experiment implements the exact native GGML
+`Q4_K[M=12288,K=4096] x Q8_K[K=4096] -> F32` dot product used by the Qwen3.5
+9B gate/up projection. It consumes the 28,311,552-byte Q4_K matrix directly,
+quantizes only the 16,384-byte F32 activation to the native 4,672-byte Q8_K
+layout, and preserves FP16 `d`/`dmin`, FP32 Q8_K `d`, and the signed block-sum
+minimum compensation. Zero weights, zero activation, scale/minimum edge cases,
+multiple random seeds, sentinels, and the exact real GGUF
+`blk.0.ffn_gate.weight` tensor all passed their CPU references. This establishes
+**correctness GO** for the format algebra and physical AIE2P implementation;
+it does not add Q4_K to the backend's type translation or registry.
+
+The best organization processes each worker's 24 rows as three eight-row
+groups with the Q8_K super-block pair outside the row loop. Relative to the
+repaired row-at-a-time kernel, this reduces logical core-local activation reads
+from 112,128 to 14,016 bytes per worker and improves full p50 from 2,407.381 to
+1,763.780 us over 10,001 measured iterations. All 34 retained reference checks
+were exact within the stated tolerance, with no non-finite value or sentinel
+corruption. Effective native-weight bandwidth is 16.052 GB/s.
+
+The matched device-resident HIP control used the same `0x12345678` native
+weight and F32 activation payloads and measured 337.339 us full p50, or
+83.926 GB/s. XDNA is therefore 5.229x slower and provides 19.13% of HIP's
+effective weight throughput. The decision is **integration NO-GO**: do not add
+this artifact to the tracked registry or automatic offload policy. If further
+research resumes, the 8+8+8 implementation is the baseline and must remain
+explicitly opt-in until it clears a matched end-to-end gate.
+
+The corrected Q4_K report has SHA-256
+`20e06be0bb4eb15d1f73f1dc68778e4c70465325fc0733158a6c056f391a81ca`.
+The selected package's directed/random/real-GGUF correctness log has SHA-256
+`163bf96b096fd8825ee147064621865d1670fb61e89d302b8f4b4abb0824730a`;
+its XCLBIN has SHA-256
+`2afd0da10043d61efa8ea40e2d0187ae41c949593869f29792bcf05a367f4b4c`.
+The retained 10,001-iteration XDNA log has SHA-256
+`19efddcff8f9a9f0628d74f60c9bd88d02ff0d0fefad9e33a3d86bbbb1d21703`;
+the matched HIP stdout has SHA-256
+`7a5da4134480ee855cca6aadf1d3ee520b9aa4b55bbe7323c2dabd523375b334`.
+
 ## Decode shape census and next compute step
 
 GGUF tensor dimensions are listed below as decode `M x K` (`N=1`), not the
@@ -797,6 +909,10 @@ reader's `[ne0, ne1]` storage display:
 | --- | --- | ---: | --- |
 | Llama 3.2 1B (hidden 2048, FFN 8192) | gate/up | 8192 x 2048 | BF16 |
 | Llama 3.2 1B | down | 2048 x 8192 | BF16 |
+| Llama 3.2 3B (hidden 3072, FFN 8192) | Q/output | 3072 x 3072 | BF16 |
+| Llama 3.2 3B | K/V | 1024 x 3072 | BF16 |
+| Llama 3.2 3B | gate/up | 8192 x 3072 | BF16 |
+| Llama 3.2 3B | down | 3072 x 8192 | BF16 |
 | stories15M (hidden 288, FFN 768) | Q/K/V/output | 288 x 288 | Q4_0 |
 | stories15M | gate/up | 768 x 288 | Q4_0 |
 | stories15M | down | 288 x 768 | Q4_0 |
@@ -806,6 +922,13 @@ reader's `[ne0, ne1]` storage display:
 | Gemma 4 E4B | gate/up | 10240 x 2560 | Q4_0 |
 | Gemma 4 E4B | down | 2560 x 10240 | Q4_1 |
 | Qwen 3.5 4B (hidden 2560, FFN 9216) | gate/up | 9216 x 2560 | Q8_0 |
+| Qwen 3.5 4B | down | 2560 x 9216 | Q8_0 |
+| Qwen 3.5 4B | recurrent QKV | 8192 x 2560 | Q8_0 |
+| Qwen 3.5 4B | full-attention K/V | 1024 x 2560 | Q8_0 |
+| Qwen 3.5 9B (hidden 4096, FFN 12288) | gate/up | 12288 x 4096 | Q4_K |
+| Qwen 3.5 9B | down | 4096 x 12288 | Q6_K |
+| Qwen 3.5 9B | recurrent QKV | 8192 x 4096 | Q5_K |
+| Qwen 3.5 9B | full-attention Q | 8192 x 4096 | Q4_K |
 | Gemma 4 12B (hidden 3840, FFN 15360) | Q | 4096 x 3840 | Q4_0 |
 | Gemma 4 12B | K/V | 2048 x 3840 | Q4_0 |
 | Gemma 4 12B | attention output | 3840 x 4096 | Q4_0 |
@@ -838,23 +961,45 @@ integration experiment is to expand the raw Q/K/V projections together before
 their postprocessing, matching the existing `build_attn()` intent; a wider
 backend-driven graph-reordering API is not justified yet.
 
-The next specialized family should target the remaining E4B Q4_0 Q and
-attention-output projections. Q4_1 down projections require a separate format
-contract. The Qwen 3.5 Q8_0 milestone demonstrates materially higher XDNA
-weight bandwidth, but its same-shape HIP result remains 2.94x faster; any next
-Q8_0 projection must be selected from an actual graph byte/call census rather
-than inferred from this one specialization. Each admitted shape remains a
-registry entry with its own worker/DMA geometry and correctness tolerance; it
-does not add shape switches to GGML or the XDNA runtime.
+The measured format frontier is now broad enough to choose the next work by
+hardware evidence rather than model size alone. Statistics retain the protocol
+used by each physical experiment; the comparison column reports its matched
+HIP conclusion rather than mixing p50 and order-balanced means.
 
-The measured regimes now separate cleanly: 288x288 and 512x2560 are dominated
-by the command envelope, while Q4_0 10240x2560 and Q8_0 9216x2560 expose
-sustained kernel/dataflow throughput at 19.25 and 31.55 GB/s respectively.
-The next high-value questions are whether compute-tile codegen or a safe
-explicit ping-pong topology can move beyond those bandwidths, whether the model
-loader can provision large `ROCm_Host` allocations reliably, whether the
-read-only mmap gate passes after a driver upgrade, and whether concurrent
-compute/free/teardown can be given a safe contract.
+| Native weight / decode shape | Best retained XDNA complete result | Effective weight BW | Matched HIP result |
+| --- | ---: | ---: | --- |
+| Q4_0 512 x 2560 | 106.757 us mean | 6.91 GB/s | 4.4-5.0x faster |
+| Q4_0 10240 x 2560 | 765.908 us mean | 19.25 GB/s | 4.7-4.9x faster |
+| Q8_0 9216 x 2560 | 794.53 us process-median | 31.55 GB/s | 269.80 us, 2.94x faster |
+| BF16 8192 x 2048 | 722.667 us full p50 | 46.52 GB/s | 388.104/391.938 us, 1.84-1.86x faster |
+| Q4_K 12288 x 4096, cache-only | 1,763.780 us full p50 | 16.052 GB/s | 337.339 us, 5.229x faster |
+
+The BF16 production shape is the closest measured crossover. The next
+compute specialization should therefore probe Llama 3.2 3B gate/up
+`BF16[8192,3072]` before adding another low-precision family: it is a real
+56-call-per-token shape, grows each matrix from 32 to 48 MiB, and tests whether
+the current 46.52 GB/s array mapping scales as fixed overhead is further
+amortized. It remains an experiment, not an assumed win; admission requires
+the exact CPU reference, sustained physical stress, and matched device and
+shared-host HIP controls. The corresponding down projection has the same
+matrix byte count but only 28 calls per token and different row geometry, so it
+follows only if the gate/up result supports a reusable BF16 family.
+
+Q4_K correctness does not justify tracking a 5.229x-losing artifact, and the
+mixed Qwen 9B policy would still require Q5_K and Q6_K for broad coverage.
+Q4_1 down projections likewise require a separate format contract. Any next
+Q8_0 or Q4_0 specialization must be selected from graph byte/call coverage and
+must beat the corresponding matched controls rather than extrapolating from a
+single format. Each admitted shape remains a registry entry with its own
+worker/DMA geometry and correctness tolerance; it does not add model-name
+switches to GGML or the XDNA runtime.
+
+The remaining high-value questions are whether BF16 scaling, compute-tile
+codegen, or a safe explicit ping-pong topology can move beyond the measured
+bandwidths, whether the model loader can provision large `ROCm_Host`
+allocations reliably, whether the read-only mmap gate passes after a driver
+upgrade, and whether concurrent compute/free/teardown can be given a safe
+contract.
 Depth-two forwarding remains disabled; four-wave depth-one task groups are the largest stress-tested controller batch, while an eight-wave batch hung under sustained load.
 AIE2 requires its own implementation and is not inferred from the tested AIE2P kernel.
 
@@ -863,12 +1008,13 @@ AIE2 requires its own implementation and is not inferred from the tested AIE2P k
 | Question | Current evidence |
 | --- | --- |
 | Clean ACCEL registration and discovery? | **GO**: dynamic `XDNA0`, real XRT/plugin/device-node path. |
-| Real GGML `MUL_MAT` on XDNA? | **GO for fixed Q4_0, Q8_0, and BF16 shapes**; CPU comparisons pass, the exact Q8_0 production shape passes physically, and a real Q4_0 GGUF `Qcur-0` node executed. |
+| Real GGML `MUL_MAT` on XDNA? | **GO for tracked fixed Q4_0, Q8_0, and BF16 shapes**; CPU comparisons pass, the exact Q8_0 production shape passes physically, and a real Q4_0 GGUF `Qcur-0` node executed. Native Q4_K x Q8_K is physically correct only in a cache-local research harness and is not advertised by the backend. |
 | Fundamentally UMA/system-backed weights? | **GO for writable CPU and `ROCm_Host` allocations**: a physical HIP/XDNA probe consumed the same page-aligned system-memory weight pointer, with one XRT registration and no secondary weight copy. |
 | Reuse without per-token weight copy? | **GO for serialized immutable-buffer lifetimes**: persistent parent/view/run reuse has zero weight-copy bytes, and observer-driven eviction passes exact owner/base/data ABA reuse with two registrations and no hits. Mutable/test weights use one explicit native-byte staging copy per call. Concurrent compute/free/backend teardown is not claimed. |
 | Ordinary read-only GGUF mmap? | **NO on the installed driver, fail-closed automatically**: the complete file-backed `PROT_READ` parent/subview/sync probe fails with errno 12, leaving `mmap_support` and `CPU_Mapped` acceptance disabled. Upstream driver commit `ed8fb2dd172bde623d7112a1bd674fc0e3c4cae4` contains the required read-only pin/IOMMU path; only a successful post-upgrade runtime probe enables the positive path, which is not physically validated here. |
-| Fixed batch-one GEMV? | **GO for native 288x288, 512x2560, and 10240x2560 Q4_0, native 9216x2560 Q8_0, plus 288x288 and 8192x2048 BF16**. All six variants pass together in one physical backend instance, and the BF16 production shape independently passes a 10,001-launch stress run. Q4_0 reaches 6.91/19.25 GB/s, Q8_0 reaches 31.55 GB/s, and BF16 reaches 46.52 GB/s without repacking or a secondary immutable-weight copy. Broader dtype/shape coverage remains open. |
-| ROCm comparison and hybrid value? | **Capability scheduling, shared weights, and a real small-GGUF hybrid graph GO; performance NO-GO for the measured isolated shapes.** The physical pre-policy path kept `pp32` off XDNA and executed 48 XDNA projections for `tg2` from one `ROCm_Host` model allocation, with persistent page-window registrations and zero immutable-weight copy. Current normal `[ROCm,XDNA,CPU]` order leaves mutually supported decode on ROCm; `GGML_XDNA_PREFER_OFFLOAD=1` is the explicit control for reproducing intentional XDNA placement. Fair synchronized HIP is about 4.4-5.0x faster at Q4_0 512x2560, 4.7-4.9x at Q4_0 10240x2560, 2.94x at Q8_0 9216x2560, and 1.84-1.86x at BF16 8192x2048; HIP is about 12x faster at Q4_0 288x288. The larger native-BF16 shape narrows the gap materially but does not reverse it. The Q8_0 and BF16 production descriptors therefore keep `prefer_for_offload=false`. Fused K/V saves one XDNA command floor but remains slower than HIP, and the tested gate/up pair is slower than two optimized XDNA calls. No end-to-end hybrid performance win is claimed. |
+| Fixed batch-one GEMV? | **GO for native 288x288, 512x2560, and 10240x2560 Q4_0, native 9216x2560 Q8_0, plus 288x288 and 8192x2048 BF16**. All six tracked variants pass together in one physical backend instance, and the BF16 production shape independently passes a 10,001-launch stress run. Q4_0 reaches 6.91/19.25 GB/s, Q8_0 reaches 31.55 GB/s, and BF16 reaches 46.52 GB/s without repacking or a secondary immutable-weight copy. The cache-only Q4_K row-batched kernel is correctness GO but integration NO-GO at 16.052 GB/s and 5.229x slower than its matched HIP control. Broader dtype/shape coverage remains open. |
+| Four-model real-GGUF inference matrix? | **GO for the 16-cell ROCm-resident A1 correctness, placement, pp512, and tg128 reference; OPEN for A2/B/C.** All requested exact files and four same-type KV modes completed with Flash Attention. A2 shared-host HIP, automatic hybrid B, and forced exact-shape C remain separate required gates. TTFT, per-node HIP counts, utilization, and energy were not measured. |
+| ROCm comparison and hybrid value? | **Capability scheduling, shared weights, and a real small-GGUF hybrid graph GO; performance NO-GO for the measured isolated shapes.** The physical pre-policy path kept `pp32` off XDNA and executed 48 XDNA projections for `tg2` from one `ROCm_Host` model allocation, with persistent page-window registrations and zero immutable-weight copy. Current normal `[ROCm,XDNA,CPU]` order leaves mutually supported decode on ROCm; `GGML_XDNA_PREFER_OFFLOAD=1` is the explicit control for reproducing intentional XDNA placement. Fair synchronized HIP is about 4.4-5.0x faster at Q4_0 512x2560, 4.7-4.9x at Q4_0 10240x2560, 2.94x at Q8_0 9216x2560, 1.84-1.86x at BF16 8192x2048, and 5.229x at cache-only Q4_K 12288x4096; HIP is about 12x faster at Q4_0 288x288. The larger native-BF16 shape narrows the gap materially but does not reverse it. All tracked production descriptors therefore keep `prefer_for_offload=false`. Fused K/V saves one XDNA command floor but remains slower than HIP, and the tested gate/up pair is slower than two optimized XDNA calls. No end-to-end hybrid performance win is claimed. |
 | NPU utilization and energy? | **OPEN**: installed XRT/sysfs exposes neither a per-kernel utilization/energy counter nor estimated NPU power (`Estimated Power: N/A`); external SoC telemetry is required. |
 
 The experiment is a no-go if direct-layout Q4_0 cannot beat HIP after activation

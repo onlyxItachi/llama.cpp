@@ -17,6 +17,14 @@ directly. The optimized Q4_0 artifact distributes the nine 32-row groups over
 nine workers. The 288x288 BF16 reference remains single-worker; the production
 BF16 specialization uses all 32 compute tiles.
 
+Native Q4_K x Q8_K was also proven physically correct for the Qwen3.5 9B
+`M=12288, K=4096` gate/up shape in a cache-only row-batched experiment. It is
+deliberately not generated or registered here: the best 10,001-iteration XDNA
+result was 1,763.780 us full p50 versus 337.339 us for the exact-payload HIP
+control, or 5.229x slower. The retained research report and the four-model
+ROCm/KV baseline are summarized in `docs/xdna-backend-design.md`; they are
+evidence for the next kernel decision, not additional advertised capability.
+
 Kernel artifacts are generated, not committed. With an MLIR-AIE IRON
 environment containing Peano:
 
