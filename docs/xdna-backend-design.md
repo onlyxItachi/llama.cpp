@@ -218,6 +218,18 @@ Writable `CPU` and an owning device's declared host buffer (including the physic
 On the installed driver the physical probe logged `DRM_IOCTL_AMDXDNA_CREATE_BO` errno 12 (`ENOMEM`) and failed closed, so `--load-mode none` is still required for an XDNA-eligible model allocation.
 The evidence log `mmap-capability-combined-20260812.log` has SHA-256 `19669d9e7b6b6bb2c9e6c7c7aea2d6cfa34899289458f3635b4f717f459e9b42`.
 After a driver upgrade, a successful run of the complete probe is the positive gate that enables both `mmap_support` and exact `CPU_Mapped` acceptance; that positive outcome has not been physically validated here.
+The already-installed Ubuntu 7.0.0-29 kernel retains the same unconditional
+`FOLL_WRITE` pin as the running 7.0.0-27 kernel, so merely rebooting into it
+will not enable read-only GGUF registration. Mainline Linux also reverted its
+earlier implementation; the reviewed capability boundary is AMD xdna-driver
+commit `ed8fb2dd172bde623d7112a1bd674fc0e3c4cae4` or a tested descendant, not
+an XRT version string. The current behavior-based probe should remain the
+admission rule. After an attended coherent driver/XRT upgrade and reboot, the
+positive gate must additionally run a real kernel from an exact read-only
+file mapping, match CPU output, report a nonzero XDNA submission and zero
+weight-copy bytes, then repeat registration teardown before real-GGUF mmap is
+claimed. The primary-source stack audit has SHA-256
+`25566727961b37ab2622ab52631587229ed91b7d5bbaf52f17b013e7fd5503a5`.
 
 Immutable `GGML_BACKEND_BUFFER_USAGE_WEIGHTS` take the persistent userptr path.
 Ordinary mutable/test buffers use a separate state-owned XRT BO: the runtime
