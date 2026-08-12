@@ -1,5 +1,7 @@
 #include "xdna-runtime.h"
 
+#include "xdna-artifact.h"
+
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
 #include "ggml.h"
@@ -21,7 +23,6 @@
 #include <cstring>
 #include <exception>
 #include <fcntl.h>
-#include <fstream>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -41,9 +42,6 @@
 namespace ggml_xdna {
 
 namespace {
-
-constexpr size_t artifact_header_bytes = 64;
-constexpr char artifact_magic[8] = { 'G', 'G', 'X', 'D', 'N', 'A', '1', '\0' };
 
 device_architecture architecture_from_device_name(const std::string & name) {
     if (name == "RyzenAI-npu4" || name == "RyzenAI-npu5" || name == "RyzenAI-npu6") {
@@ -116,78 +114,6 @@ private:
 
 [[noreturn]] void throw_system_error(const char * operation) {
     throw std::system_error(errno, std::generic_category(), operation);
-}
-
-uint32_t read_le32(const unsigned char * value) {
-    return static_cast<uint32_t>(value[0]) |
-           (static_cast<uint32_t>(value[1]) << 8u) |
-           (static_cast<uint32_t>(value[2]) << 16u) |
-           (static_cast<uint32_t>(value[3]) << 24u);
-}
-
-uint64_t read_le64(const unsigned char * value) {
-    return static_cast<uint64_t>(read_le32(value)) |
-           (static_cast<uint64_t>(read_le32(value + 4)) << 32u);
-}
-
-struct artifact_contents {
-    std::vector<char> xclbin_data;
-    std::vector<uint32_t> instructions;
-};
-
-artifact_contents read_artifact_bundle(const std::string & path, const xdna_kernel_variant & variant) {
-    std::ifstream stream(path, std::ios::binary | std::ios::ate);
-    if (!stream) {
-        throw std::runtime_error("failed to open XDNA artifact bundle " + path);
-    }
-
-    const auto end = stream.tellg();
-    if (end < static_cast<std::streamoff>(artifact_header_bytes)) {
-        throw std::runtime_error("truncated XDNA artifact bundle " + path);
-    }
-
-    std::vector<unsigned char> bytes(static_cast<size_t>(end));
-    stream.seekg(0);
-    stream.read(reinterpret_cast<char *>(bytes.data()), static_cast<std::streamsize>(end));
-    if (!stream) {
-        throw std::runtime_error("failed to read XDNA artifact bundle " + path);
-    }
-
-    if (std::memcmp(bytes.data(), artifact_magic, sizeof(artifact_magic)) != 0 ||
-            read_le32(bytes.data() + 8) != artifact_header_bytes ||
-            read_le32(bytes.data() + 12) != variant.artifact_abi_version ||
-            read_le32(bytes.data() + 16) != variant.artifact_kind ||
-            read_le32(bytes.data() + 20) != variant.m ||
-            read_le32(bytes.data() + 24) != variant.k ||
-            read_le32(bytes.data() + 28) != variant.weight_bytes ||
-            read_le32(bytes.data() + 32) != variant.device_activation_bytes ||
-            read_le32(bytes.data() + 36) != variant.device_output_bytes ||
-            read_le64(bytes.data() + 56) != 0 || variant.n != 1) {
-        throw std::runtime_error("XDNA artifact ABI metadata mismatch in " + path);
-    }
-
-    const uint64_t xclbin_bytes_u64 = read_le64(bytes.data() + 40);
-    const uint64_t instruction_bytes_u64 = read_le64(bytes.data() + 48);
-    const size_t payload_bytes = bytes.size() - artifact_header_bytes;
-    if (xclbin_bytes_u64 == 0 || instruction_bytes_u64 == 0 ||
-            xclbin_bytes_u64 > payload_bytes ||
-            instruction_bytes_u64 != payload_bytes - xclbin_bytes_u64 ||
-            instruction_bytes_u64 % sizeof(uint32_t) != 0) {
-        throw std::runtime_error("invalid XDNA artifact payload sizes in " + path);
-    }
-
-    const size_t xclbin_bytes = static_cast<size_t>(xclbin_bytes_u64);
-    const size_t instruction_bytes = static_cast<size_t>(instruction_bytes_u64);
-    artifact_contents result;
-    result.xclbin_data.assign(
-        reinterpret_cast<const char *>(bytes.data() + artifact_header_bytes),
-        reinterpret_cast<const char *>(bytes.data() + artifact_header_bytes + xclbin_bytes));
-    result.instructions.resize(instruction_bytes / sizeof(uint32_t));
-    std::memcpy(
-        result.instructions.data(),
-        bytes.data() + artifact_header_bytes + xclbin_bytes,
-        instruction_bytes);
-    return result;
 }
 
 uint64_t elapsed_ns(
@@ -394,7 +320,7 @@ kernel_configuration probe_kernel_configuration(const device_info & info) noexce
                 kernel_artifact_configuration configuration;
                 configuration.variant = &variant;
                 configuration.artifact_path = artifact;
-                artifact_contents contents = read_artifact_bundle(configuration.artifact_path, variant);
+                detail::artifact_contents contents = detail::read_artifact_bundle(configuration.artifact_path, variant);
                 configuration.xclbin_data = std::move(contents.xclbin_data);
                 configuration.instructions = std::move(contents.instructions);
                 result.artifacts.emplace_back(std::move(configuration));

@@ -12,6 +12,8 @@ endif()
 
 ggml_add_backend_library(ggml-xdna
     ggml-xdna.cpp
+    xdna-artifact.cpp
+    xdna-artifact.h
     xdna-lazy-cache.h
     xdna-kernel-registry.cpp
     xdna-kernel-registry.h

@@ -372,6 +372,16 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     llama_build_and_test(test-alloc.cpp)
     llama_build_and_test(test-backend-sched.cpp)
     if (GGML_XDNA)
+        add_executable(
+            test-xdna-artifact
+            test-xdna-artifact.cpp
+            ${PROJECT_SOURCE_DIR}/ggml/src/ggml-xdna/xdna-artifact.cpp
+        )
+        target_include_directories(test-xdna-artifact PRIVATE
+            ${PROJECT_SOURCE_DIR}/ggml/src/ggml-xdna
+        )
+        target_compile_features(test-xdna-artifact PRIVATE cxx_std_17)
+        llama_test(test-xdna-artifact)
         add_executable(test-xdna-lazy-cache test-xdna-lazy-cache.cpp)
         target_include_directories(test-xdna-lazy-cache PRIVATE
             ${PROJECT_SOURCE_DIR}/ggml/src/ggml-xdna
