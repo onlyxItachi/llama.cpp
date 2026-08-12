@@ -246,7 +246,8 @@ for 32 waves. A native row is 4,096 bytes. Sixteen rows would require 16,384
 eight-row object is an ABI/topology requirement rather than an arbitrary tile
 choice. The placed design uses 41,004 of 65,536 local bytes per core and
 131,200 of 524,288 bytes per memtile group. One activation acquisition is
-retained across all waves and four waves share each depth-one task group.
+retained across all waves. The current shim schedule repeats one task per
+stream across all 32 waves while keeping every object FIFO at depth one.
 
 Seven physical directed patterns, including first/last-column impulses and
 finite BF16 normal/subnormal extremes, matched a long-double CPU reference
@@ -322,7 +323,7 @@ non-finites, NMSE `5.2182310884410422e-15`, unchanged weight bytes, and zero
 post-ingest weight-payload copies.
 
 The fixed K=2048 topology scales to K=3072 with 32 workers, eight rows per
-worker, 32 waves, depth-one FIFOs, and four waves per task group. The pinned
+worker, 32 waves, and depth-one FIFOs. The pinned
 toolchain's placed MLIR shows a 12-byte IRON state object per worker; this is an
 observed toolchain footprint budgeted by the generator, not an architectural
 constant. Each compute tile uses 59,436 of 65,536 local bytes, leaving 6,100
@@ -348,6 +349,29 @@ have SHA-256
 and
 `6c8022bd11b30b9e4fcd0824f4f72524b3ebf14dd4c2cc2c83dbb8572c012385`;
 the instruction stream remains byte-identical to the standalone candidate.
+
+The tracked generator now replaces the 256 one-wave weight tasks and 256
+one-wave output tasks with eight 32-wave repeated tasks for each stream. With
+activation, this deliberately reduces shim tasks from 513 to 17 and controller
+bytes from 72,884 to 2,452. The compute kernel, depth-one FIFOs, memory layout,
+locks, routes, 32 cores, 112 flows, and 16 links remain unchanged; non-runtime
+addressed MLIR and all 32 placed core ELFs matched the retained controls. The
+Makefile runs a fail-closed controller decoder after `aiecc` for both K values
+and before packaging.
+
+At K=2048, the 15/15 physical matrix passed all parity/directed/sustained
+checks and exact bounded reads of both Llama 1B gate and up tensors. A balanced
+A/B matrix reduced full p50 from 724.2425 to 668.540 us (7.691%) and kernel
+p50 from 721.792 to 664.927 us (7.878%); one attempt required a swap-only
+retry. The report and evidence manifest have SHA-256
+`39b3deaf9aca6dd83b984095e0961ee71d1e743c52fe4b6dd83006eb5c4f1ac9`
+and
+`25d36584702974fe7b577e5ffd1b7545131a90d48144956f85b09db68ec18bd8`.
+At K=3072, the exact Llama 3B gate tensor remained correct and balanced full
+and kernel p50 improved by 7.232% and 8.353%. Its final report has SHA-256
+`5aa8131d9bdc3b681a87d80848b71464f7f8ee77b9f5b92f44d1fe3b54e70b6c`.
+HIP remains faster for both shapes, so both descriptors retain
+`prefer_for_offload=false`.
 
 A separate K=3072 ping-pong experiment used four rows per worker, 128 rows per
 wave, 64 waves, and depth-two weight/output FIFOs. All seven directed patterns,

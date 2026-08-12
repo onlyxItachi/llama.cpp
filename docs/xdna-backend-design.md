@@ -409,14 +409,15 @@ A native row is 4,096 bytes. The AIE2P core-DMA length field accepts at most
 granule. The selected eight-row object uses 8,192 granules. Eight columns by
 four compute rows provide 32 workers, 256 output rows per wave, and 32 waves.
 One BF16 activation acquisition remains live across all waves. Eight memtile
-groups each split four worker-weight objects and join four outputs; four waves
-share each depth-one task group. The placed core uses 41,004 of 65,536 local
-bytes and each group uses 131,200 of 524,288 memtile bytes.
+groups each split four worker-weight objects and join four outputs. The placed
+core uses 41,004 of 65,536 local bytes and each group uses 131,200 of 524,288
+memtile bytes. The current shim schedule repeats one task per stream across all
+32 waves while retaining depth-one object FIFOs.
 
 The final three-row plus two-row compute grouping has no stack references.
 Peano `-O2` and `-O3` produced the same 2,036-byte object with SHA-256
 `e20e70fa41d2c778d17bbc5b337555609cf8f04a0ebb49cfae229e152c7d3413`.
-The ABI-v1 bundle is 188,051 bytes with SHA-256
+The retained 513-task ABI-v1 bundle is 188,051 bytes with SHA-256
 `6f9132673cf1f6fc90445766dcadb07edddffa6d62f9b3a6e1574dc62fb62d1f`;
 its 72,884-byte instruction stream has SHA-256
 `91d5b29a0b6ff922d2a7ef1ae2ab1eee2316eaeccf82b402f71721771f3adcfc`.
@@ -471,18 +472,18 @@ zero post-ingest weight-payload copies. The cold 3.262 ms launch is correctness
 evidence, not a steady performance result.
 
 The K=3072 program preserves the K=2048 spatial mapping: 32 workers, eight rows
-per worker, 256 rows per wave, 32 waves, depth-one FIFOs, and four waves per
-task group. A worker weight object uses 12,288 of the 16,383 available 32-bit
-core-DMA granules. The pinned toolchain's placed MLIR reports a 12-byte IRON
-state object per worker; the generator budgets this toolchain-observed
-footprint rather than treating it as an architecture guarantee. Stack,
-weights, activation, output, and that state use 59,436 of 65,536 compute-tile
-bytes, leaving 6,100. Each memtile group uses 196,736 of 524,288 bytes.
+per worker, 256 rows per wave, 32 waves, and depth-one FIFOs. A worker weight
+object uses 12,288 of the 16,383 available 32-bit core-DMA granules. The pinned
+toolchain's placed MLIR reports a 12-byte IRON state object per worker; the
+generator budgets this toolchain-observed footprint rather than treating it
+as an architecture guarantee. Stack, weights, activation, output, and that
+state use 59,436 of 65,536 compute-tile bytes, leaving 6,100. Each memtile
+group uses 196,736 of 524,288 bytes.
 
 Peano `-O2` and `-O3` produced byte-identical 2,056-byte objects with
 SHA-256
 `709be05f3ea7a728633af78428575706b3f13afc38c5cd4281da522d2ce8d564`,
-so the build retains `-O2`. The cache-only ABI-v1/kind-1 bundle is 188,563
+so the build retains `-O2`. The retained 513-task ABI-v1/kind-1 bundle is 188,563
 bytes with SHA-256
 `6a682f17a066a76aef2e865ef3fb56427c0ab55d42132438655994db8d4ef641`.
 Its 72,884-byte instruction stream has SHA-256
@@ -507,6 +508,39 @@ then passed exact old/new `edge` and `special_finite` physical A/B tests, and
 both generic K variants passed in the single seven-artifact ordinary backend
 process. These gates extend the standalone K=3072 evidence to tracked
 integration without changing its opt-in policy.
+
+### Repeated shim-task fusion
+
+The tracked generator now replaces 256 one-wave weight tasks and 256 one-wave
+output tasks with eight 32-wave repeated weight tasks and eight repeated
+output tasks. Including activation, this intentionally reduces the shim task
+count from 513 to 17 and the controller stream from 72,884 to 2,452 bytes.
+The numerical kernel, 32 cores, 112 flows, 16 links, depth-one FIFOs, routes,
+locks, memory placement, and host ABI are unchanged. Static comparison found
+the non-runtime addressed MLIR identical and all 32 placed core ELFs
+byte-identical. A post-`aiecc` verifier checks the exact v0.1 operation order,
+absolute shim addresses, reserved fields, repeats, encoded 20-bit strides,
+host offsets, and final buffer endpoints before packaging either K value.
+
+For K=2048, the 15/15 phase-one matrix passed FIFO parity, all directed cases,
+1,001-launch closures, and exact bounded reads of both Llama 1B
+`blk.0.ffn_gate.weight` and `blk.0.ffn_up.weight`. The balanced phase-two A/B
+matrix reduced full p50 from 724.2425 to 668.540 us (7.691%) and kernel p50
+from 721.792 to 664.927 us (7.878%). One fused full-path attempt was excluded
+only for swap movement; its retry passed, and every accepted cell passed the
+strict numerical and state checks. The durable report and top-level evidence
+manifest have SHA-256
+`39b3deaf9aca6dd83b984095e0961ee71d1e743c52fe4b6dd83006eb5c4f1ac9`
+and
+`25d36584702974fe7b577e5ffd1b7545131a90d48144956f85b09db68ec18bd8`.
+
+For K=3072, the repeated-task artifact retained exact correctness for the
+pinned Llama 3B gate tensor and reduced balanced full p50 from 1,055.645 to
+979.295 us (7.232%) and kernel p50 from 1,049.432 to 961.773 us (8.353%). Its
+final report has SHA-256
+`5aa8131d9bdc3b681a87d80848b71464f7f8ee77b9f5b92f44d1fe3b54e70b6c`.
+HIP remains faster for both shapes, so task fusion changes neither descriptor
+to automatic placement: both keep `prefer_for_offload=false`.
 
 A source-only alternative tested whether explicit ping-pong could lift the
 bandwidth plateau. It reduced each worker to four rows, doubled the wave count
@@ -1093,17 +1127,17 @@ hardware evidence rather than model size alone. Statistics retain the protocol
 used by each physical experiment; the comparison column reports its matched
 HIP conclusion rather than mixing p50 and order-balanced means.
 
-| Native weight / decode shape | Best retained XDNA complete result | Effective weight BW | Matched HIP result |
+| Native weight / decode shape | Best current XDNA complete result | Effective weight BW | Matched HIP result |
 | --- | ---: | ---: | --- |
 | Q4_0 512 x 2560 | 106.757 us mean | 6.91 GB/s | 4.4-5.0x faster |
 | Q4_0 10240 x 2560 | 765.908 us mean | 19.25 GB/s | 4.7-4.9x faster |
 | Q8_0 9216 x 2560 | 794.53 us process-median | 31.55 GB/s | 269.80 us, 2.94x faster |
-| BF16 8192 x 2048 | 722.667 us full p50 | 46.52 GB/s | 388.104/391.938 us, 1.84-1.86x faster |
-| BF16 8192 x 3072, opt-in | 1,044.585 us full p50 | 48.26 GB/s | 549.750/583.869 us, 1.79-1.90x faster |
+| BF16 8192 x 2048, repeated tasks | 668.540 us balanced full p50 | 50.73 GB/s sustained | 388.104/391.938 us; XDNA remains 1.70-1.72x slower |
+| BF16 8192 x 3072, repeated tasks, opt-in | 979.295 us balanced full p50 | 51.52 GB/s sustained | 526.994-583.869 us; XDNA remains 1.68-1.83x slower |
 | Q4_K 12288 x 4096, cache-only | 1,763.780 us full p50 | 16.052 GB/s | 337.339 us, 5.229x faster |
 
-The Llama 3.2 3B gate/up probe raised XDNA effective bandwidth by only 3.7%
-from the K=2048 full result while HIP remained about 1.8-1.9x faster. Larger
+The Llama 3.2 3B gate/up probe raised sustained task-fused XDNA effective
+bandwidth by only about 1.6% from K=2048 while HIP remained faster. Larger
 native BF16 matrices therefore narrow the gap compared with the quantized
 families but do not establish a crossover. The same-byte down projection has
 different row geometry, and another fixed BF16 shape is not justified without
@@ -1126,7 +1160,7 @@ plateau, whether the model loader can provision large `ROCm_Host`
 allocations reliably, whether the read-only mmap gate passes after a driver
 upgrade, and whether concurrent compute/free/teardown can be given a safe
 contract.
-Depth-two forwarding remains disabled; four-wave depth-one task groups are the largest stress-tested controller batch, while an eight-wave batch hung under sustained load.
+Depth-two forwarding remains disabled. The repeated-task controller safely covers all 32 waves with depth-one FIFOs; an earlier eight-wave multi-task batch hung under sustained load and is not used.
 AIE2 requires its own implementation and is not inferred from the tested AIE2P kernel.
 
 ## Go/no-go checkpoint
@@ -1138,9 +1172,9 @@ AIE2 requires its own implementation and is not inferred from the tested AIE2P k
 | Fundamentally UMA/system-backed weights? | **GO for writable CPU and `ROCm_Host` allocations**: a physical HIP/XDNA probe consumed the same page-aligned system-memory weight pointer, with one XRT registration and no secondary weight copy. |
 | Reuse without per-token weight copy? | **GO for serialized immutable-buffer lifetimes**: persistent parent/view/run reuse has zero weight-copy bytes, and observer-driven eviction passes exact owner/base/data ABA reuse with two registrations and no hits. Mutable/test weights use one explicit native-byte staging copy per call. Concurrent compute/free/backend teardown is not claimed. |
 | Ordinary read-only GGUF mmap? | **NO on the installed driver, fail-closed automatically**: the complete file-backed `PROT_READ` parent/subview/sync probe fails with errno 12, leaving `mmap_support` and `CPU_Mapped` acceptance disabled. Upstream driver commit `ed8fb2dd172bde623d7112a1bd674fc0e3c4cae4` contains the required read-only pin/IOMMU path; only a successful post-upgrade runtime probe enables the positive path, which is not physically validated here. |
-| Fixed batch-one GEMV? | **GO for seven integrated variants**. Native 288x288, 512x2560, and 10240x2560 Q4_0, native 9216x2560 Q8_0, plus 288x288, 8192x2048, and 8192x3072 BF16 pass together in one physical backend instance. BF16 8192x3072 also passed seven directed patterns, 10,001 launches, and the pinned real tensor at 48.26 GB/s; the generic K=2048 replacement passed exact old/new physical A/B gates. The cache-only Q4_K row-batched kernel is correctness GO but integration NO-GO at 16.052 GB/s and 5.229x slower than its matched HIP control. Broader dtype/shape coverage remains open. |
+| Fixed batch-one GEMV? | **GO for seven integrated variants**. Native 288x288, 512x2560, and 10240x2560 Q4_0, native 9216x2560 Q8_0, plus 288x288, 8192x2048, and 8192x3072 BF16 pass together in one physical backend instance. The two production BF16 shapes now use the physically validated 17-task controller; K=2048 passed both exact Llama 1B gate/up tensors and K=3072 passed the exact Llama 3B gate tensor. The cache-only Q4_K row-batched kernel is correctness GO but integration NO-GO at 16.052 GB/s and 5.229x slower than its matched HIP control. Broader dtype/shape coverage remains open. |
 | Four-model real-GGUF inference matrix? | **GO for the 16-cell ROCm-resident A1 correctness, placement, pp512, and tg128 reference; PARTIAL functional GO for six A2/B cells; OPEN for comparative A2/B performance and C.** All requested exact files and four same-type KV modes completed A1 with Flash Attention. Completed A2/B real graphs kept every `MUL_MAT` on ROCm and recorded zero XDNA submissions/copies under automatic policy. Host-global swap stopped the matrix before Llama 3B Q4_0, both Qwen models, every A2/B benchmark, and forced C. TTFT, utilization, energy, and full-matrix HIP node counts remain unmeasured. |
-| ROCm comparison and hybrid value? | **Capability scheduling, shared weights, and a real small-GGUF hybrid graph GO; performance NO-GO for the measured isolated shapes.** The physical pre-policy path kept `pp32` off XDNA and executed 48 XDNA projections for `tg2` from one `ROCm_Host` model allocation, with persistent page-window registrations and zero immutable-weight copy. Current normal `[ROCm,XDNA,CPU]` order leaves mutually supported decode on ROCm; `GGML_XDNA_PREFER_OFFLOAD=1` is the explicit control for reproducing intentional XDNA placement. Fair synchronized HIP is about 4.4-5.0x faster at Q4_0 512x2560, 4.7-4.9x at Q4_0 10240x2560, 2.94x at Q8_0 9216x2560, 1.84-1.86x at BF16 8192x2048, 1.79-1.98x at BF16 8192x3072, and 5.229x at cache-only Q4_K 12288x4096; HIP is about 12x faster at Q4_0 288x288. Larger native-BF16 shapes narrow the gap materially but do not reverse it. All production descriptors therefore keep `prefer_for_offload=false`. Fused K/V saves one XDNA command floor but remains slower than HIP, and the tested gate/up pair is slower than two optimized XDNA calls. No end-to-end hybrid performance win is claimed. |
+| ROCm comparison and hybrid value? | **Capability scheduling, shared weights, and a real small-GGUF hybrid graph GO; performance NO-GO for the measured isolated shapes.** The physical pre-policy path kept `pp32` off XDNA and executed 48 XDNA projections for `tg2` from one `ROCm_Host` model allocation, with persistent page-window registrations and zero immutable-weight copy. Current normal `[ROCm,XDNA,CPU]` order leaves mutually supported decode on ROCm; `GGML_XDNA_PREFER_OFFLOAD=1` is the explicit control for reproducing intentional XDNA placement. Fair synchronized HIP is about 4.4-5.0x faster at Q4_0 512x2560, 4.7-4.9x at Q4_0 10240x2560, 2.94x at Q8_0 9216x2560, 1.70-1.72x at task-fused BF16 8192x2048, 1.68-1.83x at task-fused BF16 8192x3072, and 5.229x at cache-only Q4_K 12288x4096; HIP is about 12x faster at Q4_0 288x288. Larger native-BF16 shapes narrow the gap materially but do not reverse it. All production descriptors therefore keep `prefer_for_offload=false`. Fused K/V saves one XDNA command floor but remains slower than HIP, and the tested gate/up pair is slower than two optimized XDNA calls. No end-to-end hybrid performance win is claimed. |
 | NPU utilization and energy? | **OPEN**: installed XRT/sysfs exposes neither a per-kernel utilization/energy counter nor estimated NPU power (`Estimated Power: N/A`); external SoC telemetry is required. |
 
 The experiment is a no-go if direct-layout Q4_0 cannot beat HIP after activation
