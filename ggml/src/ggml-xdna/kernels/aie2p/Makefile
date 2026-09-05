@@ -7,6 +7,7 @@ SITE_PACKAGES = $(shell "$(PYTHON)" -c 'import sysconfig; print(sysconfig.get_pa
 MLIR_AIE ?= $(SITE_PACKAGES)/mlir_aie
 PEANO ?= $(SITE_PACKAGES)/llvm-aie
 AIECC ?= $(MLIR_AIE)/bin/aiecc
+AIECC_JOBS ?= 1
 PEANO_CLANGXX ?= $(PEANO)/bin/clang++
 AIE_API_INCLUDE ?= $(MLIR_AIE)/include
 XCLBINUTIL ?= xclbinutil
@@ -66,7 +67,7 @@ $(addprefix gemv-bf16-m8192-k3072,.xclbin .insts.bin .ggmlxdna): CONTROLLER_COLU
 $(BF16_M8192_ARTIFACTS): $(BF16_M8192_CONTROLLER_VERIFIER)
 
 %.xclbin %.insts.bin &: %.mlir %.o | check-environment
-	PATH="$(MLIR_AIE)/bin:$$PATH" $(AIECC) \
+	PATH="$(MLIR_AIE)/bin:$$PATH" $(AIECC) -j $(AIECC_JOBS) \
 		--alloc-scheme=basic-sequential \
 		--aie-generate-xclbin --no-compile-host --xclbin-name=$*.xclbin \
 		--no-xchesscc --no-xbridge --peano "$(PEANO)" \
@@ -86,3 +87,5 @@ gemv-q8_0-m9216-k2560.ggmlxdna: PACK_ARGS := --kind-id 3 --m 9216 --k 2560 --wei
 	$(if $(CONTROLLER_COLUMNS),$(PYTHON) $(BF16_M8192_CONTROLLER_VERIFIER) --columns $(CONTROLLER_COLUMNS) $*.insts.bin)
 	$(PYTHON) pack-artifact.py --abi-version 1 --architecture aie2p $(PACK_ARGS) \
 		--xclbin $*.xclbin --instructions $*.insts.bin --output $@
+
+$(GENERATED): Makefile

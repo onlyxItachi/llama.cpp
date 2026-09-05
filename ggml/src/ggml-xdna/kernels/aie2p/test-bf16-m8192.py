@@ -4,7 +4,9 @@
 """Host-only tests for the BF16 M=8192 generator and controller verifier."""
 
 import importlib.util
+import os
 from pathlib import Path
+import shutil
 import struct
 import subprocess
 import sys
@@ -254,6 +256,33 @@ class GeometryTests(unittest.TestCase):
             GENERATOR._repeat_count(0)
         with self.assertRaisesRegex(ValueError, "6-bit"):
             GENERATOR._repeat_count(65)
+
+
+class BuildRuleTests(unittest.TestCase):
+    def test_recipe_changes_rebuild_existing_artifacts(self):
+        if shutil.which("make") is None:
+            self.skipTest("GNU make is unavailable")
+        stem = "gemv-bf16-m8192-k2048"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("Makefile", "gemv-bf16-m8192.cpp", "gemv-bf16-m8192.py",
+                         "pack-artifact.py", "verify-bf16-m8192-controller.py"):
+                shutil.copyfile(HERE / name, root / name)
+                os.utime(root / name, (100, 100))
+            for suffix in (".o", ".mlir", ".xclbin", ".insts.bin", ".ggmlxdna"):
+                output = root / (stem + suffix)
+                output.write_bytes(b"build fixture, not an executable artifact")
+                os.utime(output, (200, 200))
+            command = ["make", "--no-print-directory", "-n", "-C", directory,
+                       "SITE_PACKAGES=/unused", "PYTHON=" + sys.executable, stem + ".ggmlxdna"]
+            before = subprocess.run(command, capture_output=True, text=True, check=True)
+            self.assertNotIn("--aie-generate-xclbin", before.stdout)
+            os.utime(root / "Makefile", (300, 300))
+            after = subprocess.run(command, capture_output=True, text=True, check=True)
+            self.assertIn("--aie-generate-xclbin", after.stdout)
+            self.assertIn("/bin/aiecc -j 1", after.stdout)
+            self.assertIn("-c gemv-bf16-m8192.cpp", after.stdout)
+            self.assertNotIn("-c Makefile", after.stdout)
 
 
 class ControllerVerifierTests(unittest.TestCase):

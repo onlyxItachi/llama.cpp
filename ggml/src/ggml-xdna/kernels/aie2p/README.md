@@ -113,6 +113,9 @@ site-packages location from that interpreter. `MLIR_AIE` and `PEANO` remain
 explicit overrides for nonstandard environments.
 Run `make clean` before changing the compiler/toolchain path; Make cannot infer
 toolchain identity changes from timestamps alone.
+Makefile changes invalidate generated outputs, including packaging metadata changes.
+`AIECC_JOBS` defaults to one so a single artifact recipe does not start an unbounded compiler pool; keep outer Make parallelism bounded as well.
+For reproducibility checks, build from a clean source export into a new directory rather than removing retained validated artifacts.
 
 The Q4_0 kernel decodes the IEEE FP16 scale bits and packed `q - 8` values
 on-tile without a dequantized weight copy. AIE2P/arch21 has no native IEEE-FP16
