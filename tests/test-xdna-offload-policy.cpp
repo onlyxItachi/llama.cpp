@@ -182,6 +182,11 @@ static void test_variant(const ggml_xdna::xdna_kernel_variant & variant) {
     ggml_backend_buffer_set_usage(owner, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     require(problem_from_ggml(output, variant.architecture, &other) &&
             other.weights_usage == weight_usage::immutable, "immutable weight usage was lost");
+    ggml_set_param(weights);
+    require(problem_from_ggml(output, variant.architecture, &other) &&
+            other.weights_usage == weight_usage::mutable_buffer,
+            "trainable weights were marked immutable");
+    require(kernel_variant_supports(variant, other), "trainable weights lost the supported mutable staging path");
     weights->buffer = nullptr;
     ggml_backend_buffer_free(owner);
 

@@ -839,13 +839,14 @@ struct runtime::impl {
     xrt::bo & prepare_weight(
             kernel_state & kernel,
             const ggml_tensor * tensor,
+            weight_usage usage,
             uint64_t * copied_bytes) {
         if (tensor == nullptr || tensor->buffer == nullptr || tensor->data == nullptr ||
                 !ggml_backend_buffer_is_host(tensor->buffer)) {
             throw std::runtime_error("XDNA weight tensor has no supported host buffer backing");
         }
 
-        if (ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        if (usage == weight_usage::immutable) {
             *copied_bytes = 0;
             return register_weight(*kernel.program->device, tensor);
         }
@@ -1020,7 +1021,7 @@ int runtime::compute(ggml_tensor * op) noexcept {
             throw std::runtime_error("selected XDNA kernel variant has an unsupported host storage conversion");
         }
         uint64_t weight_copy_bytes = 0;
-        xrt::bo & weight_bo = pimpl->prepare_weight(*kernel, op->src[0], &weight_copy_bytes);
+        xrt::bo & weight_bo = pimpl->prepare_weight(*kernel, op->src[0], problem.weights_usage, &weight_copy_bytes);
 
         const auto activation_pack_start = std::chrono::steady_clock::now();
         ggml_fp32_to_bf16_row(
@@ -1050,7 +1051,7 @@ int runtime::compute(ggml_tensor * op) noexcept {
         host_memory_fence();
 
         kernel->bound_weight_owner =
-            ggml_backend_buffer_get_usage(op->src[0]->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS ?
+            problem.weights_usage == weight_usage::immutable ?
                 op->src[0]->buffer : nullptr;
         detail::execution_gate::guard execution_guard = pimpl->programs->acquire_execution();
         kernel->ensure_run();

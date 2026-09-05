@@ -205,24 +205,25 @@ static ggml_backend_t ggml_backend_xdna_device_init_backend(ggml_backend_dev_t d
 
     auto * dev_ctx = static_cast<xdna_device_context *>(dev->context);
     try {
-        auto * ctx = new xdna_backend_context(dev_ctx->programs);
+        auto ctx = std::make_unique<xdna_backend_context>(dev_ctx->programs);
         if (dev_ctx->programs->inventory_available() && !ctx->runtime.kernel_available()) {
             const std::string status = ctx->runtime.kernel_status();
             GGML_LOG_ERROR("ggml_xdna: no configured kernel remains usable on %s: %s\n",
                     dev_ctx->info.name.c_str(), status.c_str());
-            delete ctx;
             return nullptr;
         }
         const std::string status = ctx->runtime.kernel_status();
         GGML_LOG_INFO("ggml_xdna: initialized %s at %s (%s); %s\n",
                 dev_ctx->info.name.c_str(), dev_ctx->info.bdf.c_str(), dev_ctx->info.architecture.c_str(),
                 status.c_str());
-        return new ggml_backend {
+        auto * backend = new ggml_backend {
             /* .guid    = */ ggml_backend_xdna_guid(),
             /* .iface   = */ ggml_backend_xdna_i,
             /* .device  = */ dev,
-            /* .context = */ ctx,
+            /* .context = */ ctx.get(),
         };
+        ctx.release();
+        return backend;
     } catch (const std::exception & e) {
         GGML_LOG_ERROR("ggml_xdna: failed to initialize %s: %s\n", dev_ctx->info.name.c_str(), e.what());
         return nullptr;

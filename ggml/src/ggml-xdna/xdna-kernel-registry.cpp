@@ -172,7 +172,8 @@ bool problem_from_ggml(
     result.src0_hadamard = ggml_get_op_params_i32(op, 1) == GGML_HINT_SRC0_IS_HADAMARD;
     if (weights->buffer == nullptr) {
         result.weights_usage = weight_usage::unknown;
-    } else if (ggml_backend_buffer_get_usage(weights->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+    } else if (ggml_backend_buffer_get_usage(weights->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+            (weights->flags & GGML_TENSOR_FLAG_PARAM) == 0) {
         result.weights_usage = weight_usage::immutable;
     } else {
         result.weights_usage = weight_usage::mutable_buffer;
