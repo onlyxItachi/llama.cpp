@@ -1541,15 +1541,17 @@ struct test_case {
 
         ggml_backend_xdna_get_stats_v2_t get_xdna_stats = nullptr;
         std::array<ggml_backend_xdna_stats_v2, 3> xdna_stats = {};
+        bool is_xdna_backend = false;
         bool stats_complete = false;
         bool repeated_ok = true;
         if (repeated) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend1);
             ggml_backend_reg_t reg = dev == nullptr ? nullptr : ggml_backend_dev_backend_reg(dev);
             if (reg != nullptr) {
+                is_xdna_backend = strcmp(ggml_backend_reg_name(reg), "XDNA") == 0;
                 get_xdna_stats = (ggml_backend_xdna_get_stats_v2_t)
                     ggml_backend_reg_get_proc_address(reg, "ggml_backend_xdna_get_stats_v2");
-                if (strcmp(ggml_backend_reg_name(reg), "XDNA") == 0 && get_xdna_stats == nullptr) {
+                if (is_xdna_backend && get_xdna_stats == nullptr) {
                     printf("XDNA statistics procedure is unavailable ");
                     repeated_ok = false;
                 }
@@ -1593,6 +1595,18 @@ struct test_case {
                            std::equal(current_output.begin(), current_output.end(), first_output.begin())) {
                     printf("output did not change between test invocations ");
                     repeated_ok = false;
+                }
+                if (invocation != 0 && is_xdna_backend) {
+                    // XDNA GEMV is a deterministic linear map with sign-symmetric finite F32-to-BF16 conversion.
+                    // Negating the full activation must negate every output; float equality equates +0 and -0.
+                    const bool sign_symmetric = current_output.size() == first_output.size() &&
+                        std::equal(
+                            current_output.begin(), current_output.end(), first_output.begin(),
+                            [](float second, float first) { return second == -first; });
+                    if (!sign_symmetric) {
+                        printf("XDNA output did not negate exactly between test invocations ");
+                        repeated_ok = false;
+                    }
                 }
 
                 if (get_xdna_stats != nullptr && stats_complete &&
@@ -4925,6 +4939,8 @@ struct test_mul_mat_weight : public test_mul_mat {
     using test_mul_mat::test_mul_mat;
     using test_mul_mat::build_graph;
 
+    std::vector<float> first_activation;
+
     bool use_weight_context() override { return true; }
     // Keep the primary graph, backend runtime, and immutable registration alive across A/B.
     size_t test_invocation_count() override { return 2; }
@@ -4938,13 +4954,22 @@ struct test_mul_mat_weight : public test_mul_mat {
         GGML_ASSERT(ggml_nelements(activation) >= 2);
         GGML_ASSERT(ggml_nbytes(activation) == ggml_nelements(activation) * sizeof(float));
 
-        const float directed_lanes[2] = {
-            invocation == 0 ? 1.0f : -1.0f,
-            0x1p-8f,
-        };
-        GGML_ASSERT(ggml_bf16_to_fp32(ggml_fp32_to_bf16(directed_lanes[0])) == directed_lanes[0]);
-        GGML_ASSERT(ggml_bf16_to_fp32(ggml_fp32_to_bf16(directed_lanes[1])) == directed_lanes[1]);
-        ggml_backend_tensor_set(activation, directed_lanes, 0, sizeof(directed_lanes));
+        if (invocation == 0) {
+            first_activation.resize(ggml_nelements(activation));
+            ggml_backend_tensor_get(activation, first_activation.data(), 0, ggml_nbytes(activation));
+            return;
+        }
+
+        GGML_ASSERT(first_activation.size() == static_cast<size_t>(ggml_nelements(activation)));
+        std::vector<float> negated_activation(first_activation.size());
+        std::transform(
+            first_activation.begin(), first_activation.end(), negated_activation.begin(),
+            [](float value) { return -value; });
+        GGML_ASSERT(std::any_of(first_activation.begin(), first_activation.end(), [](float value) {
+            return value != 0.0f;
+        }));
+        ggml_backend_tensor_set(
+            activation, negated_activation.data(), 0, negated_activation.size() * sizeof(float));
     }
 
     ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
