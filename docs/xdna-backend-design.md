@@ -1,6 +1,6 @@
 # Native AMD XDNA backend: bring-up design and evidence
 
-Status: functional selective backend; not an upstream-quality candidate, updated 2026-09-05.
+Status: pre-upstream candidate (3) for the documented Linux/AIE2P scope; not an upstream-quality candidate (4), updated 2026-09-05.
 This document records what was inspected and physically exercised; it is not a claim of production-ready XDNA decode.
 
 ## Current-upstream completion pass (2026-09-05)
@@ -41,6 +41,29 @@ No graph-builder rewrite, second IR, runtime compiler, or new scheduler API is j
 
 Current limitations still include read-only mmap rejection on the installed driver, unvalidated concurrent allocation destruction, separate AIE2 implementation requirements, large-model allocation and hybrid performance gates, and missing cross-platform/physical CI.
 The observer, shared-host scheduling, transient-copy, and CPU-mapped-buffer core changes need independent maintainer review before any upstream proposal.
+
+## Private-fork development validation (2026-09-05)
+
+The repair checkpoint was published to `onlyxItachi/llama.cpp:feat/ggml-xdna` under explicit private-fork authorization, followed by further reviewed development commits.
+Final executable-source validation uses `3335e9d913d28eb54544098ffe8ad751158fb064`, based on upstream `6a1a922d269908a29cbd4b49c27e6a8e7fd10fae`; repeated upstream fetches found no newer base during this pass.
+No upstream submission, issue, discussion, or comment was created or modified.
+
+The build now exposes the four focused scheduler, artifact, cache, and policy tests without enabling XDNA or finding XRT. They pass in the ordinary Linux build, a Clang ThreadSanitizer build, and a Clang AddressSanitizer/UndefinedBehaviorSanitizer build. The last configuration also exposed pre-existing upstream null-pointer arithmetic in graph-overhead calculation; integer-address increment fixes it without an API or layout change, with exact-overhead allocation checks across graph sizes and gradient-storage modes.
+Installed static, dynamic-backend, and XDNA-disabled packages pass isolated external-consumer checks. Static consumers retain their selected XRT SDK root. Relocated dynamic consumers require no XRT SDK at configuration time, but loading the plugin requires the declared XRT runtime. Removing that runtime from the controlled loader search rejects XDNA while the installed CPU plugin remains loadable.
+
+Trainable tensors in `WEIGHTS` buffers are not constants in GGML. XDNA now follows the upstream `WEIGHTS && !PARAM` predicate and uses its existing per-call staging path for parameters. A two-call physical reproducer returned stale data before the fix: output `0.1171875` instead of the updated CPU reference `-1.1328125`. Both calls are exact after the fix, with two native-weight copies and synchronizations and no persistent registration. Immutable model payloads must remain frozen until their owner is freed; changing flags is not a cache-invalidation API. Backend construction also keeps its context in RAII ownership until publication.
+
+All seven AOT artifacts were rebuilt from a clean source export at `e6fd8a5a292e6b352a7ff7f25f8f3b744bc8608c`, using MLIR-AIE 1.3.4, Peano `21.0.0.2026062301+cb664e8c`, Python 3.12.13, XRT 2.20, and bounded outer/compiler parallelism. Makefile recipe changes now invalidate generated outputs; a host regression fails on the old Makefile and passes on the new one. This establishes a fresh source rebuild on the retained toolchain, not bit-reproducibility across clean machines: xclbin metadata differs, and cross-host/toolchain-distribution CI remains open.
+
+The final native-weight operation test uses the original activation and then its whole-vector negation, poisons the GGML destination before each invocation, and constructs a fresh CPU comparison while retaining the primary graph and registrations. Every XDNA output must negate exactly, in addition to ordinary numerical comparison and finite/non-vacuous output checks. This avoids a rejected intermediate harness revision whose changed BF16 edge-case lane masked smaller errors in aggregate NMSE. All seven cases pass with fourteen launches, seven first-use weight synchronizations, seven reuse hits, and zero immutable-weight copy bytes; the same seven cases pass the HIP CPU-reference comparison. A physical acceptance wrapper additionally requires the exact seven-case inventory: ordinary `test-backend-ops` success alone can include skipped unsupported cases.
+
+The final real-GGUF smoke repeats CPU, configured CPU+XDNA with and without priority override, HIP, forced HIP+XDNA, and ordinary HIP-first+XDNA on the native-layout `stories15M-q4_0.gguf`. All six text outputs have SHA-256 `afbaea16edb09763443b80c13cd58d7c61a40b9d0eb3a4c7807fde9ccfb19c3f`. Forced hybrid runs 744 successful NPU calls, with 24 weight views, 720 hits, and zero immutable-weight copies; ordinary HIP-first runs zero NPU calls. Binaries, CPU oracle libraries, all seven artifacts, and wrappers are hashed before and after final physical runs. These are functional results only, not matched performance or larger-model rocBLAS validation.
+
+The development evidence is retained in `/home/hamza-usta/.cache/llama-xdna-development-20260905-gelKfY`, including the factual human-ownership handoff, source/build inputs, before/after failures, sanitizer logs, package consumers, and `*-core-final` physical results. Historical evidence directories and validated artifacts were preserved.
+
+Level 3 here means coherent selective integration, current upstream base, strong correctness gates, safe documented lifetime semantics, a reproducible local AOT build, conservative GPU preference, and real GGUF execution. Level 4 is not claimed. Required follow-up includes independent human review of the generic core surfaces, portable package/artifact CI, cross-host and driver coverage, positive mmap validation, injected XRT failure-path testing, and broader current-base GGUF coverage. No current result establishes an end-to-end HIP performance win, energy advantage, or reason to enable automatic priority. No unused graph matcher, runtime compiler, or model-specific selection logic was introduced.
+
+Related upstream work inspected read-only: [XDNA request #21725](https://github.com/ggml-org/llama.cpp/issues/21725), [AMD HRX draft #27218](https://github.com/ggml-org/llama.cpp/pull/27218), and [its architecture discussion #27219](https://github.com/ggml-org/llama.cpp/discussions/27219). These are references for human review, not claims of endorsement or equivalent implementation.
 
 ## Revisions and repository state
 
@@ -294,8 +317,8 @@ An `xrt::run` retains its bound weight BO, so owner eviction also clears that bi
 The next call recreates the run lazily and binds the current weight.
 A binding exception likewise discards a partially bound run.
 If `wait()` throws after submission, the runtime synchronously calls `xrt::run::abort()` before releasing borrowed storage, then resets the run; failure to abort terminates the process rather than risk an active userptr.
-The generic observer contract requires add, remove, and free calls for a buffer to be caller-serialized.
-Concurrent compute, owner destruction, and backend teardown are not claimed as supported.
+Distinct observer handles may be added and removed concurrently while the owner buffer is live.
+The caller must serialize owner destruction against buffer use, observer mutation, and backend teardown; observers do not extend allocation lifetime.
 
 Page-window registration avoids pinning an unrelated full model allocation.
 Adjacent GGML weights can share a boundary page, so their rounded XRT parents
