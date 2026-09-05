@@ -19,6 +19,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#include "ggml-xdna.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1246,6 +1247,12 @@ struct test_case {
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     virtual bool use_weight_context() { return false; }
+    // Stateful cases can reuse the primary graph while the CPU comparison is rebuilt per invocation.
+    virtual size_t test_invocation_count() { return 1; }
+    virtual void prepare_test_invocation(ggml_context * ctx, size_t invocation) {
+        GGML_UNUSED(ctx);
+        GGML_UNUSED(invocation);
+    }
 
     ggml_cgraph * gf = nullptr;
     ggml_cgraph * gb = nullptr;
@@ -1519,12 +1526,133 @@ struct test_case {
         if (fused_nodes_to_verify.size() == 0 && run_whole_graph()) {
             fused_nodes_to_verify.push_back(out);
         }
-        const bool cmp_ok = ggml_backend_compare_graph_backend(backend1, backend2, gf, callback, &ud,
-                                                               run_whole_graph() ? fused_nodes_to_verify.data() : nullptr,
-                                                               fused_nodes_to_verify.size());
+
+        const size_t invocation_count = test_invocation_count();
+        GGML_ASSERT(invocation_count > 0);
+        const bool repeated = invocation_count > 1;
+        if (repeated) {
+            GGML_ASSERT(invocation_count == 2);
+            GGML_ASSERT(out->op == GGML_OP_MUL_MAT);
+            GGML_ASSERT(out->type == GGML_TYPE_F32);
+            GGML_ASSERT(ggml_is_contiguous(out));
+            GGML_ASSERT(ggml_nelements(out) > 0);
+            GGML_ASSERT(ggml_nbytes(out) == ggml_nelements(out) * sizeof(float));
+        }
+
+        ggml_backend_xdna_get_stats_v2_t get_xdna_stats = nullptr;
+        std::array<ggml_backend_xdna_stats_v2, 3> xdna_stats = {};
+        bool stats_complete = false;
+        bool repeated_ok = true;
+        if (repeated) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend1);
+            ggml_backend_reg_t reg = dev == nullptr ? nullptr : ggml_backend_dev_backend_reg(dev);
+            if (reg != nullptr) {
+                get_xdna_stats = (ggml_backend_xdna_get_stats_v2_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_xdna_get_stats_v2");
+                if (strcmp(ggml_backend_reg_name(reg), "XDNA") == 0 && get_xdna_stats == nullptr) {
+                    printf("XDNA statistics procedure is unavailable ");
+                    repeated_ok = false;
+                }
+                if (get_xdna_stats != nullptr) {
+                    stats_complete = get_xdna_stats(backend1, &xdna_stats[0], sizeof(xdna_stats[0]));
+                    if (!stats_complete) {
+                        printf("failed to read initial XDNA statistics ");
+                        repeated_ok = false;
+                    }
+                }
+            }
+        }
+
+        const std::vector<uint32_t> output_poison(
+            repeated ? ggml_nelements(out) : 0, UINT32_C(0x7fc00000));
+        std::vector<float> first_output;
+        bool cmp_ok = true;
+        for (size_t invocation = 0; invocation < invocation_count; ++invocation) {
+            prepare_test_invocation(ctx.get(), invocation);
+            if (repeated) {
+                ggml_backend_tensor_set(out, output_poison.data(), 0, ggml_nbytes(out));
+            }
+
+            const bool invocation_cmp_ok = ggml_backend_compare_graph_backend(
+                backend1, backend2, gf, callback, &ud,
+                run_whole_graph() ? fused_nodes_to_verify.data() : nullptr,
+                fused_nodes_to_verify.size());
+            cmp_ok = cmp_ok && invocation_cmp_ok;
+
+            if (repeated) {
+                std::vector<float> current_output = tensor_to_float(out);
+                if (!std::all_of(current_output.begin(), current_output.end(), [](float value) {
+                        return std::isfinite(value);
+                    })) {
+                    printf("non-finite output after test invocation %zu ", invocation + 1);
+                    repeated_ok = false;
+                }
+                if (invocation == 0) {
+                    first_output = current_output;
+                } else if (current_output.size() != first_output.size() ||
+                           std::equal(current_output.begin(), current_output.end(), first_output.begin())) {
+                    printf("output did not change between test invocations ");
+                    repeated_ok = false;
+                }
+
+                if (get_xdna_stats != nullptr && stats_complete &&
+                        !get_xdna_stats(backend1, &xdna_stats[invocation + 1],
+                                        sizeof(xdna_stats[invocation + 1]))) {
+                    printf("failed to read XDNA statistics after invocation %zu ", invocation + 1);
+                    stats_complete = false;
+                    repeated_ok = false;
+                }
+            }
+        }
+
+        if (get_xdna_stats != nullptr && stats_complete) {
+            const auto expect_delta = [&](size_t invocation, const char * name,
+                                          uint64_t before, uint64_t after, uint64_t expected) {
+                const bool matches = after >= before && after - before == expected;
+                if (!matches) {
+                    printf("XDNA %s after invocation %zu changed from %" PRIu64 " to %" PRIu64
+                           ", expected delta %" PRIu64 " ",
+                           name, invocation + 1, before, after, expected);
+                    repeated_ok = false;
+                }
+            };
+
+            for (size_t invocation = 0; invocation < invocation_count; ++invocation) {
+                const ggml_backend_xdna_stats_v2 & before = xdna_stats[invocation];
+                const ggml_backend_xdna_stats_v2 & after = xdna_stats[invocation + 1];
+                expect_delta(invocation, "successful compute", before.successful_compute_calls,
+                             after.successful_compute_calls, 1);
+                expect_delta(invocation, "kernel submission", before.base.kernel_submissions,
+                             after.base.kernel_submissions, 1);
+                expect_delta(invocation, "run start", before.run_start_calls, after.run_start_calls, 1);
+                expect_delta(invocation, "run wait", before.run_wait_calls, after.run_wait_calls, 1);
+                expect_delta(invocation, "activation pack", before.activation_pack_calls,
+                             after.activation_pack_calls, 1);
+                expect_delta(invocation, "activation sync", before.activation_sync_calls,
+                             after.activation_sync_calls, 1);
+                expect_delta(invocation, "output sync", before.output_sync_calls, after.output_sync_calls, 1);
+                expect_delta(invocation, "output copy", before.output_copy_calls, after.output_copy_calls, 1);
+                expect_delta(invocation, "output sync bytes", before.output_sync_bytes,
+                             after.output_sync_bytes, ggml_nbytes(out));
+                expect_delta(invocation, "output copy bytes", before.output_copy_bytes,
+                             after.output_copy_bytes, ggml_nbytes(out));
+                expect_delta(invocation, "root buffer registration", before.base.buffer_registrations,
+                             after.base.buffer_registrations, invocation == 0 ? 1 : 0);
+                expect_delta(invocation, "root buffer registration hit", before.base.buffer_registration_hits,
+                             after.base.buffer_registration_hits, 0);
+                expect_delta(invocation, "weight registration", before.base.weight_registrations,
+                             after.base.weight_registrations, invocation == 0 ? 1 : 0);
+                expect_delta(invocation, "weight registration hit", before.base.weight_registration_hits,
+                             after.base.weight_registration_hits, invocation == 0 ? 0 : 1);
+                expect_delta(invocation, "weight sync", before.base.weight_sync_to_device_calls,
+                             after.base.weight_sync_to_device_calls, invocation == 0 ? 1 : 0);
+                expect_delta(invocation, "weight copy bytes", before.base.weight_copy_bytes,
+                             after.base.weight_copy_bytes, 0);
+            }
+        }
 
         // Create test result
-        bool        test_passed = ud.ok && cmp_ok;
+        bool        test_passed = ud.ok && cmp_ok && repeated_ok;
         std::string error_msg   = test_passed ? "" : (!cmp_ok ? "compare failed" : "test failed");
         test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", supported, test_passed,
                            error_msg);
@@ -4798,6 +4926,26 @@ struct test_mul_mat_weight : public test_mul_mat {
     using test_mul_mat::build_graph;
 
     bool use_weight_context() override { return true; }
+    // Keep the primary graph, backend runtime, and immutable registration alive across A/B.
+    size_t test_invocation_count() override { return 2; }
+
+    void prepare_test_invocation(ggml_context * ctx, size_t invocation) override {
+        GGML_ASSERT(invocation < test_invocation_count());
+        ggml_tensor * activation = ggml_get_tensor(ctx, "b");
+        GGML_ASSERT(activation != nullptr);
+        GGML_ASSERT(activation->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(activation));
+        GGML_ASSERT(ggml_nelements(activation) >= 2);
+        GGML_ASSERT(ggml_nbytes(activation) == ggml_nelements(activation) * sizeof(float));
+
+        const float directed_lanes[2] = {
+            invocation == 0 ? 1.0f : -1.0f,
+            0x1p-8f,
+        };
+        GGML_ASSERT(ggml_bf16_to_fp32(ggml_fp32_to_bf16(directed_lanes[0])) == directed_lanes[0]);
+        GGML_ASSERT(ggml_bf16_to_fp32(ggml_fp32_to_bf16(directed_lanes[1])) == directed_lanes[1]);
+        ggml_backend_tensor_set(activation, directed_lanes, 0, sizeof(directed_lanes));
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
         GGML_ASSERT(ctx_weights != nullptr);
