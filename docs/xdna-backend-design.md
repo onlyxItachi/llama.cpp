@@ -1,7 +1,46 @@
 # Native AMD XDNA backend: bring-up design and evidence
 
-Status: experimental vertical slice, updated 2026-08-12.
+Status: functional selective backend; not an upstream-quality candidate, updated 2026-09-05.
 This document records what was inspected and physically exercised; it is not a claim of production-ready XDNA decode.
+
+## Current-upstream completion pass (2026-09-05)
+
+The pass started from clean local and remote `feat/ggml-xdna` head `1b90c9ac2b3ba27e2c4d2b0412ba738cbe4756d9`.
+The local branch was rebased onto upstream `6a1a922d269908a29cbd4b49c27e6a8e7fd10fae`, producing `f1f7964541aea1b82f9897939796beed1f0bc3c5`; all 40 original changes were retained.
+`backup/xdna-before-upstream-20260905` preserves the original history; the completion changes were left uncommitted for the initial handoff and then checkpointed under the user's private-fork development authorization.
+Historical measurements below retain their original source and protocol boundaries; they are not new measurements on this upstream base.
+
+Distinct backend instances can now concurrently add and remove their own observers on a shared live buffer.
+The observer list is serialized in GGML, detached before notification, and callbacks run outside the list lock.
+Buffer destruction must still be serialized against buffer use, observer mutation, and backend teardown; observers do not extend allocation lifetime.
+A two-context host reproducer reports a ThreadSanitizer race before the fix and none after it, and existing scheduler tests cover concurrent subscriptions and callbacks that touch another buffer.
+XDNA registry context publication is also performed only once during static initialization.
+
+All seven specializations now use one private constexpr GEMV descriptor constructor with format data and exact specialization rows.
+The AOT Makefile shares compile, spatial-generation, artifact, and packaging rules; the two large BF16 variants use the existing parameterized compute source and controller.
+All descriptor fields and all 43 generated build commands match the previous implementation.
+No compute source, controller topology, artifact ABI, or inference-time dependency changed, so the existing validated artifacts were retained.
+Independent seven-row contract tests guard the inventory, and native Q4_0 fixtures now include adversarial scales, nibble ordering, and row/block boundaries.
+
+A fresh dynamic CPU/XDNA build passes the four focused host tests and all seven physical backend operation cases against CPU.
+The real `stories15M-q4_0.gguf` native-layout smoke completes 744 XDNA submissions over 31 decode steps with 24 weight views, 720 view hits, fixed first-use weight synchronization, and zero immutable-weight copy bytes.
+Its generated text matches the CPU control byte-for-byte; unsupported operations remain on CPU.
+A fresh current-base HIP module also passes the matched-text smoke, and forced HIP+XDNA executes the same 744 NPU calls from a shared `ROCm_Host` model allocation with zero immutable-weight copies.
+With all artifacts configured but no priority override, the ordinary HIP+XDNA smoke matches the reference and records zero XDNA submissions.
+These small native gfx1150 runs use no HSA architecture override and do not establish larger-model rocBLAS coverage.
+The corrected cache-local BF16 runners separately pass two changing-input, per-launch-poisoned invocations for both candidate artifacts.
+These are functional results, not performance results: the strict performance preflight rejected host swap activity before invoking its runner, with the stop reason recorded.
+Old unfinished performance protocols remain unfinished.
+
+Current upstream assigns backends and creates splits before calling per-split `graph_optimize`.
+CUDA and SYCL perform runtime pattern selection before single-node dispatch, and GGML already supplies subgraph-closure helpers.
+No new XDNA matcher is added without an accepted executable composite: the retained gate/up candidate loses to two standalone XDNA calls, while the measured K/V candidate is slower than HIP and its target graph separates the projections into different backend splits.
+Other graphs can place siblings together; this is not a claim that all K/V pairs are split.
+Future useful fusion belongs in the existing XDNA split compute scan, with explicit materialized outputs, source identity and capability checks, and single-node fallback on a match miss.
+No graph-builder rewrite, second IR, runtime compiler, or new scheduler API is justified by the present evidence.
+
+Current limitations still include read-only mmap rejection on the installed driver, unvalidated concurrent allocation destruction, separate AIE2 implementation requirements, large-model allocation and hybrid performance gates, and missing cross-platform/physical CI.
+The observer, shared-host scheduling, transient-copy, and CPU-mapped-buffer core changes need independent maintainer review before any upstream proposal.
 
 ## Revisions and repository state
 
@@ -100,11 +139,14 @@ requires an exact registered kernel and consults per-variant preference
 metadata. All current variants remain supported but default to no automatic
 preference because the measured HIP implementations are faster. Thus normal
 `[ROCm0, XDNA0, CPU]` order keeps a mutually supported operation on ROCm, while
-an XDNA-only configuration still selects XDNA as the first capable backend.
+an explicitly configured CPU+XDNA configuration still selects XDNA as the first capable backend.
 Set `GGML_XDNA_PREFER_OFFLOAD=1` to request the exact XDNA kernels explicitly
 for controlled heterogeneous experiments; unsupported shapes such as prefill
 remain on HIP. This policy is capability-driven and does not add model-specific
 placement logic.
+An unset preference override or `--no-op-offload` is not a CPU-only switch when XDNA is the first capable backend.
+For a CPU-only control, leave all XDNA artifact bundle variables unset or do not load the XDNA plugin.
+For native quantized XDNA placement, use `--no-repack`; CPU-repacked weights are correctly declined.
 
 ## Selected open stack and generation split
 

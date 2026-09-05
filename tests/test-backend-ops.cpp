@@ -4927,6 +4927,51 @@ struct test_mul_mat_weight_bf16_deterministic : public test_mul_mat_weight {
     }
 };
 
+struct test_mul_mat_weight_q4_0_deterministic : public test_mul_mat_weight {
+    using test_mul_mat_weight::test_mul_mat_weight;
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_Q4_0) {
+                GGML_ASSERT(t->ne[0] % 32 == 0);
+                std::vector<uint8_t> data(ggml_nbytes(t));
+                constexpr float scales[] = { 0.0f, 0x1p-24f, -0x1p-14f, 0.0007f, -0.0137f, 0.5f, -1.0f, 4.0f };
+                const size_t blocks_per_row = t->ne[0] / 32;
+                for (size_t ib = 0; ib < data.size() / 18; ++ib) {
+                    const uint32_t key = test_mix32(0x6a09e667u ^ static_cast<uint32_t>(ib));
+                    const bool last = ib % blocks_per_row == blocks_per_row - 1;
+                    const ggml_fp16_t scale = ggml_fp32_to_fp16(last ? -4.0f : scales[key & 7u]);
+                    memcpy(data.data() + ib * 18, &scale, sizeof(scale));
+                    for (size_t lane = 0; lane < 16; ++lane) {
+                        // GGML stores columns 0..15 in the low nibble, 16..31 in the high nibble.
+                        const uint8_t low = static_cast<uint8_t>((key + lane) & 15u);
+                        const uint8_t high = static_cast<uint8_t>((key + 3 * lane + 7) & 15u);
+                        data[ib * 18 + 2 + lane] = low | (high << 4);
+                    }
+                    data[ib * 18 + 2] = 0xf0;
+                    data[ib * 18 + 17] = 0x0f;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size());
+                continue;
+            }
+            GGML_ASSERT(t->type == GGML_TYPE_F32);
+            std::vector<float> data(ggml_nelements(t));
+            for (size_t i = 0; i < data.size(); ++i) {
+                const int value = static_cast<int>(test_mix32(0xbb67ae85u ^ static_cast<uint32_t>(i)) % 257u) - 128;
+                data[i] = value / 128.0f;
+            }
+            if (strcmp(t->name, "b") == 0) {
+                data[0] = 0.5f;
+                data[15] = -0.25f;
+                data[16] = 0.75f;
+                data[31] = -1.0f;
+                data.back() = -0.75f;
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+        }
+    }
+};
+
 // Reproducible native-Q8_0 coverage for physically validated XDNA shapes.
 // The ordinary backend-op initializer intentionally uses random_device; this
 // version fixes every packed scale, quant, and activation value so repeated
@@ -9819,16 +9864,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     // Fixed batch-1 shapes used by the initial ggml-xdna hardware kernels.
-    test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_Q4_0, GGML_TYPE_F32, 288, 1, 288, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_weight_q4_0_deterministic(GGML_TYPE_Q4_0, GGML_TYPE_F32, 288, 1, 288, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_BF16, GGML_TYPE_F32, 288, 1, 288, {1, 1}, {1, 1}));
     // Llama 3.2 1B gate/up projection shape used by ggml-xdna.
     test_cases.emplace_back(new test_mul_mat_weight_bf16_deterministic(GGML_TYPE_BF16, GGML_TYPE_F32, 8192, 1, 2048, {1, 1}, {1, 1}));
     // Llama 3.2 3B gate/up projection shape used by ggml-xdna.
     test_cases.emplace_back(new test_mul_mat_weight_bf16_deterministic(GGML_TYPE_BF16, GGML_TYPE_F32, 8192, 1, 3072, {1, 1}, {1, 1}));
     // Gemma 4 E4B sliding-window K/V projection shape used by ggml-xdna.
-    test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_Q4_0, GGML_TYPE_F32, 512, 1, 2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_weight_q4_0_deterministic(GGML_TYPE_Q4_0, GGML_TYPE_F32, 512, 1, 2560, {1, 1}, {1, 1}));
     // Gemma 4 E4B gate/up projection shape used by ggml-xdna.
-    test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_Q4_0, GGML_TYPE_F32, 10240, 1, 2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_weight_q4_0_deterministic(GGML_TYPE_Q4_0, GGML_TYPE_F32, 10240, 1, 2560, {1, 1}, {1, 1}));
     // Qwen 3.5 4B gate/up projection shape used by ggml-xdna.
     test_cases.emplace_back(new test_mul_mat_weight_q8_0_deterministic(GGML_TYPE_Q8_0, GGML_TYPE_F32, 9216, 1, 2560, {1, 1}, {1, 1}));
 
@@ -11043,12 +11088,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 16416, 1, 128, {8,  1}, {4, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 1, 16416, {8,  1}, {4, 1}, {0, 1, 2, 3}, 2*16416));
-    test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_Q4_0, GGML_TYPE_F32, 288, 1, 288, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_weight_q4_0_deterministic(GGML_TYPE_Q4_0, GGML_TYPE_F32, 288, 1, 288, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_BF16, GGML_TYPE_F32, 288, 1, 288, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_weight_bf16_deterministic(GGML_TYPE_BF16, GGML_TYPE_F32, 8192, 1, 2048, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_weight_bf16_deterministic(GGML_TYPE_BF16, GGML_TYPE_F32, 8192, 1, 3072, {1, 1}, {1, 1}));
-    test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_Q4_0, GGML_TYPE_F32, 512, 1, 2560, {1, 1}, {1, 1}));
-    test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_Q4_0, GGML_TYPE_F32, 10240, 1, 2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_weight_q4_0_deterministic(GGML_TYPE_Q4_0, GGML_TYPE_F32, 512, 1, 2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_weight_q4_0_deterministic(GGML_TYPE_Q4_0, GGML_TYPE_F32, 10240, 1, 2560, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_weight_q8_0_deterministic(GGML_TYPE_Q8_0, GGML_TYPE_F32, 9216, 1, 2560, {1, 1}, {1, 1}));
 
     // FWHT tests
