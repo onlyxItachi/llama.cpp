@@ -76,6 +76,18 @@ through another dtype's variable before advertising `MUL_MAT` support. Bundles
 remain trusted executable inputs: the header does not prove that a manually
 relabeled arbitrary xclbin implements its declared contract.
 
+## Kernel families and specializations
+
+`xdna-kernel-registry.cpp` keeps native BF16, Q4_0, and Q8_0 block formats in private `constexpr` records. `make_aie2p_gemv()` derives their shared host/device ABI and byte counts. Seven specialization rows retain the exact identities, environment variables, dimensions, and worker geometry. Offload preference remains per specialization and defaults to false.
+
+The Makefile lists artifact stems and packaging metadata, with shared compile, controller, and package rules. BF16 M8192 reuses one compute source and generator for K=2048 and K=3072; the two Q4_0 K=2560 shapes reuse one compute source. Python, MLIR-AIE, and Peano remain AOT build tools, not runtime dependencies. This does not widen the existing fixed shapes, contiguous single-batch N=1 contract, or topology limits.
+
+For another supported specialization:
+
+1. Validate that the compute source, generator, and controller support its shape and geometry; change those sources first if needed.
+2. Add its exact registry row, artifact stem, and packaging metadata. Add source aliases or family parameters only where they differ. Keep artifact ABI and symbol names consistent.
+3. Extend the existing host checks, compare generated commands and artifact metadata, and validate physical correctness before advertising capability. Enable offload preference only after a matched end-to-end comparison supports it.
+
 ## Artifact architecture identity
 
 The 64-byte `GGXDNA1` container header has two supported ABI layouts. Existing AIE2P artifacts use ABI v1 unchanged: bytes 56 through 63 are zero, and the runtime accepts this legacy layout only for an AIE2P registry variant. ABI v2 assigns stable little-endian architecture IDs independently of C++ enum values:
