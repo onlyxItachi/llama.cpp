@@ -632,7 +632,20 @@ static void test_accel_only_fallback(bool scheduler_allows_offload, bool accel_r
     ggml_backend_buffer_free(weight_buffer);
 }
 
+static void test_graph_overhead_allocation() {
+    for (size_t size : { size_t(0), size_t(1), size_t(7), size_t(32), size_t(1024) }) {
+        for (bool grads : { false, true }) {
+            ggml_context_ptr ctx(ggml_init({ ggml_graph_overhead_custom(size, grads), nullptr, true }));
+            require(ctx != nullptr, "graph overhead context allocation failed");
+            ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), size, grads);
+            require(graph != nullptr && ggml_graph_size(graph) == static_cast<int>(size),
+                    "graph overhead did not match graph allocation");
+        }
+    }
+}
+
 int main() {
+    test_graph_overhead_allocation();
     test_buffer_free_observers();
     test_buffer_free_observers_concurrent();
     test_buffer_free_observer_other_buffer();
