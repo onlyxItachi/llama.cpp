@@ -376,6 +376,9 @@ set(GGML_SHARED_LIB ${BUILD_SHARED_LIBS})
 get_cmake_property(all_variables VARIABLES)
 foreach(variable_name IN LISTS all_variables)
     if(variable_name MATCHES "^GGML_")
+        if(variable_name STREQUAL "GGML_XDNA_XRT_ROOT")
+            continue() # Keep the consumer's SDK selection.
+        endif()
         string(REPLACE ";" "\\;"
                variable_value "${${variable_name}}")
 

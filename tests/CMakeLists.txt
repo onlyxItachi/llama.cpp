@@ -370,8 +370,14 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
 
     # Needs non-public ggml{,-backend}-impl.h
     llama_build_and_test(test-alloc.cpp)
-    llama_build_and_test(test-backend-sched.cpp)
-    if (GGML_XDNA)
+    find_package(Threads REQUIRED)
+    add_executable(test-backend-sched test-backend-sched.cpp)
+    target_link_libraries(test-backend-sched PRIVATE ggml-base Threads::Threads)
+    target_compile_features(test-backend-sched PRIVATE cxx_std_17)
+    llama_test(test-backend-sched)
+
+    # These tests use host code only; they do not require the XDNA backend or XRT.
+    if (UNIX) # The artifact test uses mkstemp.
         add_executable(
             test-xdna-artifact
             test-xdna-artifact.cpp
@@ -382,20 +388,28 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
         )
         target_compile_features(test-xdna-artifact PRIVATE cxx_std_17)
         llama_test(test-xdna-artifact)
-        add_executable(test-xdna-lazy-cache test-xdna-lazy-cache.cpp)
-        target_include_directories(test-xdna-lazy-cache PRIVATE
-            ${PROJECT_SOURCE_DIR}/ggml/src/ggml-xdna
-        )
-        target_compile_features(test-xdna-lazy-cache PRIVATE cxx_std_17)
-        llama_test(test-xdna-lazy-cache)
-        llama_build_and_test(
-            test-xdna-offload-policy.cpp
-            ${PROJECT_SOURCE_DIR}/ggml/src/ggml-xdna/xdna-kernel-registry.cpp
-        )
-        target_include_directories(test-xdna-offload-policy PRIVATE
-            ${PROJECT_SOURCE_DIR}/ggml/src
-            ${PROJECT_SOURCE_DIR}/ggml/src/ggml-xdna
-        )
+    endif()
+    add_executable(test-xdna-lazy-cache test-xdna-lazy-cache.cpp)
+    target_include_directories(test-xdna-lazy-cache PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-xdna
+    )
+    target_compile_features(test-xdna-lazy-cache PRIVATE cxx_std_17)
+    target_link_libraries(test-xdna-lazy-cache PRIVATE Threads::Threads)
+    llama_test(test-xdna-lazy-cache)
+    add_executable(
+        test-xdna-offload-policy
+        test-xdna-offload-policy.cpp
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-xdna/xdna-kernel-registry.cpp
+    )
+    target_link_libraries(test-xdna-offload-policy PRIVATE ggml-base)
+    target_compile_features(test-xdna-offload-policy PRIVATE cxx_std_17)
+    target_include_directories(test-xdna-offload-policy PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/src
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-xdna
+    )
+    llama_test(test-xdna-offload-policy)
+    if (LLAMA_TESTS_INSTALL)
+        install(TARGETS test-backend-sched test-xdna-offload-policy RUNTIME)
     endif()
 endif()
 
