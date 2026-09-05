@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -100,6 +101,8 @@ struct ggml_backend_buffer_observer {
     ggml_backend_buffer_observer_t next;
 };
 
+static std::mutex ggml_backend_buffer_observer_mutex;
+
 ggml_backend_buffer_t ggml_backend_buffer_init(
                ggml_backend_buffer_type_t buft,
         struct ggml_backend_buffer_i      iface,
@@ -124,6 +127,7 @@ ggml_backend_buffer_observer_t ggml_backend_buffer_add_free_observer(
         void * user_data) {
     GGML_ASSERT(buffer != nullptr);
     GGML_ASSERT(callback != nullptr);
+    const std::lock_guard<std::mutex> lock(ggml_backend_buffer_observer_mutex);
     GGML_ASSERT(!buffer->is_freeing);
 
     auto * observer = new ggml_backend_buffer_observer {
@@ -141,6 +145,7 @@ void ggml_backend_buffer_remove_free_observer(ggml_backend_buffer_observer_t obs
         return;
     }
 
+    const std::lock_guard<std::mutex> lock(ggml_backend_buffer_observer_mutex);
     ggml_backend_buffer_t buffer = observer->buffer;
     GGML_ASSERT(buffer != nullptr);
     GGML_ASSERT(!buffer->is_freeing);
@@ -166,13 +171,17 @@ void ggml_backend_buffer_free(ggml_backend_buffer_t buffer) {
         return;
     }
 
-    GGML_ASSERT(!buffer->is_freeing);
-    buffer->is_freeing = true;
+    ggml_backend_buffer_observer_t observer;
+    {
+        const std::lock_guard<std::mutex> lock(ggml_backend_buffer_observer_mutex);
+        GGML_ASSERT(!buffer->is_freeing);
+        buffer->is_freeing = true;
+        observer = buffer->free_observers;
+        buffer->free_observers = nullptr;
+    }
 
-    // Detach the complete list before invoking foreign-backend callbacks. The
-    // backing allocation remains valid until every observer has returned.
-    ggml_backend_buffer_observer_t observer = buffer->free_observers;
-    buffer->free_observers = nullptr;
+    // Callbacks may acquire backend locks or observe other buffers. Do not hold the observer lock here.
+    // The backing allocation remains valid until every observer has returned.
     while (observer != nullptr) {
         ggml_backend_buffer_observer_t next = observer->next;
         observer->buffer = nullptr;

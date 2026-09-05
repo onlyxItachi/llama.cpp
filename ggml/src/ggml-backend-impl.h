@@ -86,10 +86,10 @@ extern "C" {
                    void *                     context,
                    size_t                     size);
 
-    // Observe destruction of a buffer owned by another backend. Add/remove/free calls for a buffer must be
-    // serialized by the caller. When a buffer is freed, all observers are detached and then invoked before
-    // iface.free_buffer releases the underlying allocation. Callbacks must not add or remove observers for the
-    // buffer and must not throw. An observer handle becomes invalid after either removal or callback invocation.
+    // Concurrent add/remove calls for distinct handles are supported while the buffer is alive.
+    // The caller must serialize buffer free with buffer use and observer add/remove calls.
+    // Observers run before iface.free_buffer; callbacks must not throw or modify this buffer's observers.
+    // Removal or notification invalidates the handle; concurrent operations on one handle are not supported.
     GGML_API ggml_backend_buffer_observer_t ggml_backend_buffer_add_free_observer(
             ggml_backend_buffer_t buffer,
             ggml_backend_buffer_free_callback_t callback,

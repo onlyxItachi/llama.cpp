@@ -648,6 +648,7 @@ struct runtime::impl {
     ~impl() {
         const std::lock_guard<std::mutex> lock(compute_mutex);
 
+        // Owner destruction must not overlap backend teardown or compute; observers do not retain the owner.
         // A live observer may call back through this impl, so cancel every
         // remaining subscription before releasing any runtime state.  Child
         // BOs must be destroyed before the userptr-backed parent BOs.

@@ -367,6 +367,7 @@ struct xdna_registry_context {
             });
             contexts.emplace_back(std::move(ctx));
         }
+        reg->context = this;
     }
 
     std::vector<std::unique_ptr<xdna_device_context>> contexts;
@@ -452,7 +453,6 @@ ggml_backend_reg_t ggml_backend_xdna_reg() {
         /* .context     = */ nullptr,
     };
     static xdna_registry_context ctx(&reg);
-    reg.context = &ctx;
     return &reg;
 }
 

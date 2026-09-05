@@ -3,10 +3,14 @@
 
 #include "../ggml/src/ggml-backend-impl.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 struct mock_device_context {
     const char * name;
@@ -294,6 +298,82 @@ static void test_buffer_free_observers() {
             "provider free callback ran before an observer");
 }
 
+static void test_buffer_free_observers_concurrent() {
+    constexpr size_t n_workers = 2;
+    constexpr size_t n_buffers = 128;
+    ggml_backend_buffer_type buft = make_mock_buffer_type(true);
+    ggml_backend_buffer_i iface = {};
+    iface.free_buffer = buffer_observer_test_provider_free;
+    std::vector<buffer_observer_test_state> states(n_buffers);
+    std::vector<buffer_observer_test_data> data(n_buffers * n_workers);
+    std::vector<ggml_backend_buffer_t> buffers(n_buffers);
+    for (size_t i = 0; i < n_buffers; ++i) {
+        buffers[i] = ggml_backend_buffer_init(&buft, iface, &states[i], 0);
+        for (size_t worker = 0; worker < n_workers; ++worker) {
+            data[i * n_workers + worker] = { &states[i], worker };
+        }
+    }
+
+    // Separate runtime locks do not serialize subscriptions to shared immutable model buffers.
+    std::mutex runtime_mutex[n_workers];
+    std::thread workers[n_workers];
+    std::atomic<size_t> progress[n_buffers];
+    for (auto & value : progress) {
+        value.store(0);
+    }
+    for (size_t worker = 0; worker < n_workers; ++worker) {
+        workers[worker] = std::thread([&, worker] {
+            const std::lock_guard<std::mutex> lock(runtime_mutex[worker]);
+            for (size_t i = 0; i < n_buffers; ++i) {
+                const auto rendezvous = [&](size_t phase) {
+                    progress[i].fetch_add(1);
+                    while (progress[i].load() < phase * n_workers) {
+                        std::this_thread::yield();
+                    }
+                };
+                auto * observer_data = &data[i * n_workers + worker];
+                rendezvous(1);
+                ggml_backend_buffer_add_free_observer(buffers[i], buffer_observer_test_callback, observer_data);
+                rendezvous(2);
+                auto temporary = ggml_backend_buffer_add_free_observer(
+                        buffers[i], buffer_observer_test_callback, observer_data);
+                rendezvous(3);
+                ggml_backend_buffer_remove_free_observer(temporary);
+                rendezvous(4);
+            }
+        });
+    }
+    for (auto & worker : workers) {
+        worker.join();
+    }
+
+    for (size_t i = 0; i < n_buffers; ++i) {
+        ggml_backend_buffer_free(buffers[i]);
+        for (size_t worker = 0; worker < n_workers; ++worker) {
+            require(states[i].observer_calls[worker] == 1, "concurrent subscription was lost or duplicated");
+            require(states[i].observer_order[worker] < states[i].provider_order,
+                    "provider released shared buffer before observer notification");
+        }
+        require(states[i].provider_calls == 1, "shared buffer provider was not called exactly once");
+    }
+}
+
+static void buffer_observer_test_other_buffer_callback(ggml_backend_buffer_t, void * user_data) {
+    auto other = static_cast<ggml_backend_buffer_t>(user_data);
+    auto handle = ggml_backend_buffer_add_free_observer(other,
+            [](ggml_backend_buffer_t, void *) { require(false, "removed cross-buffer observer was called"); }, nullptr);
+    ggml_backend_buffer_remove_free_observer(handle);
+}
+
+static void test_buffer_free_observer_other_buffer() {
+    ggml_backend_buffer_type buft = make_mock_buffer_type(true);
+    auto other = ggml_backend_buffer_init(&buft, {}, nullptr, 0);
+    auto owner = ggml_backend_buffer_init(&buft, {}, nullptr, 0);
+    ggml_backend_buffer_add_free_observer(owner, buffer_observer_test_other_buffer_callback, other);
+    ggml_backend_buffer_free(owner);
+    ggml_backend_buffer_free(other);
+}
+
 enum class memory_kind {
     host,
     device,
@@ -554,6 +634,8 @@ static void test_accel_only_fallback(bool scheduler_allows_offload, bool accel_r
 
 int main() {
     test_buffer_free_observers();
+    test_buffer_free_observers_concurrent();
+    test_buffer_free_observer_other_buffer();
     test_cpu_mapped_buffer_type_identity();
 
     const enum ggml_backend_dev_type target_types[] = {
