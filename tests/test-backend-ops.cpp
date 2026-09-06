@@ -19,7 +19,10 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#if __has_include("ggml-xdna.h")
 #include "ggml-xdna.h"
+#define GGML_TEST_XDNA_STATS
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -1539,16 +1542,19 @@ struct test_case {
             GGML_ASSERT(ggml_nbytes(out) == ggml_nelements(out) * sizeof(float));
         }
 
+        bool is_xdna_backend = false;
+        bool repeated_ok = true;
+#ifdef GGML_TEST_XDNA_STATS
         ggml_backend_xdna_get_stats_v2_t get_xdna_stats = nullptr;
         std::array<ggml_backend_xdna_stats_v2, 3> xdna_stats = {};
-        bool is_xdna_backend = false;
         bool stats_complete = false;
-        bool repeated_ok = true;
+#endif
         if (repeated) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend1);
             ggml_backend_reg_t reg = dev == nullptr ? nullptr : ggml_backend_dev_backend_reg(dev);
             if (reg != nullptr) {
                 is_xdna_backend = strcmp(ggml_backend_reg_name(reg), "XDNA") == 0;
+#ifdef GGML_TEST_XDNA_STATS
                 get_xdna_stats = (ggml_backend_xdna_get_stats_v2_t)
                     ggml_backend_reg_get_proc_address(reg, "ggml_backend_xdna_get_stats_v2");
                 if (is_xdna_backend && get_xdna_stats == nullptr) {
@@ -1562,6 +1568,12 @@ struct test_case {
                         repeated_ok = false;
                     }
                 }
+#else
+                if (is_xdna_backend) {
+                    printf("XDNA statistics support was not compiled into this test ");
+                    repeated_ok = false;
+                }
+#endif
             }
         }
 
@@ -1609,6 +1621,7 @@ struct test_case {
                     }
                 }
 
+#ifdef GGML_TEST_XDNA_STATS
                 if (get_xdna_stats != nullptr && stats_complete &&
                         !get_xdna_stats(backend1, &xdna_stats[invocation + 1],
                                         sizeof(xdna_stats[invocation + 1]))) {
@@ -1616,9 +1629,11 @@ struct test_case {
                     stats_complete = false;
                     repeated_ok = false;
                 }
+#endif
             }
         }
 
+#ifdef GGML_TEST_XDNA_STATS
         if (get_xdna_stats != nullptr && stats_complete) {
             const ggml_tensor * weights = out->src[0];
             const bool immutable_weights =
@@ -1671,6 +1686,7 @@ struct test_case {
                              after.base.weight_copy_bytes, immutable_weights ? 0 : ggml_nbytes(weights));
             }
         }
+#endif
 
         // Create test result
         bool        test_passed = ud.ok && cmp_ok && repeated_ok;

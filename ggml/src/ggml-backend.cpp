@@ -1518,17 +1518,14 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 const bool source_is_host_compute = source_type == GGML_BACKEND_DEVICE_TYPE_CPU ||
                         source_type == GGML_BACKEND_DEVICE_TYPE_ACCEL;
                 const bool source_uses_host_memory = src_buft != NULL && ggml_backend_buft_is_host(src_buft);
-                const bool immutable_weight = src_buffer != NULL &&
+                const bool src_is_weight = src_buffer != NULL &&
                         ggml_backend_buffer_get_usage(src_buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
 
-                // A GPU may support its pinned-host buffer type for immutable
-                // model weights, but cross-backend transient values must be
-                // materialized in the GPU compute buffer.  In particular,
-                // GPU compute (including fused paths) can otherwise consume
-                // a CPU/ACCEL-produced host pointer as a device-local intermediate.
+                // Preserve shared weight storage, including in-place parameter updates.
+                // GPU compute may need host intermediates in device memory despite accepting the buffer type.
                 const bool materialize_gpu_input = src_buffer_supported && target_is_gpu &&
                         target_uses_device_memory && source_is_host_compute &&
-                        source_uses_host_memory && !immutable_weight;
+                        source_uses_host_memory && !src_is_weight;
                 if (src_backend_id != cur_backend_id &&
                         (!src_buffer_supported || materialize_gpu_input)) {
                     // create a copy of the input in the split's backend

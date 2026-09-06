@@ -516,6 +516,48 @@ static void test_shared_input(
     ggml_backend_buffer_free(source_buffer);
 }
 
+static void test_shared_parameter_update(enum ggml_backend_dev_type target_type) {
+    ggml_backend_buffer_type device_buft = make_mock_buffer_type(false);
+    ggml_backend_buffer_type host_buft = make_mock_buffer_type(true);
+    mock_backend_storage cpu_backend("MockCPU", GGML_BACKEND_DEVICE_TYPE_CPU, &host_buft, &host_buft);
+    mock_backend_storage gpu_backend("MockGPU", target_type, &device_buft, &host_buft);
+    device_buft.device = &gpu_backend.device;
+    host_buft.device = &cpu_backend.device;
+
+    ggml_backend_t backends[] = { &gpu_backend.backend, &cpu_backend.backend };
+    ggml_backend_buffer_type_t bufts[] = { &device_buft, &host_buft };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, bufts, 2, 16, false, false);
+    ggml_context_ptr ctx(ggml_init({ 8 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true }));
+    require(ctx != nullptr, "failed to create parameter update context");
+
+    ggml_tensor * parameter = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 32);
+    ggml_set_param(parameter);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), &host_buft);
+    require(buffer != nullptr, "failed to allocate parameter buffer");
+    ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    ggml_tensor * gradient = ggml_dup_tensor(ctx.get(), parameter);
+    ggml_tensor * options = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 2);
+    ggml_tensor * update = ggml_opt_step_sgd(ctx.get(), parameter, gradient, options);
+    ggml_cgraph * graph = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(graph, update);
+    ggml_backend_sched_set_tensor_backend(sched, parameter, &cpu_backend.backend);
+    ggml_backend_sched_set_tensor_backend(sched, gradient, &gpu_backend.backend);
+    ggml_backend_sched_set_tensor_backend(sched, options, &gpu_backend.backend);
+    ggml_backend_sched_set_tensor_backend(sched, update, &gpu_backend.backend);
+
+    ggml_backend_sched_split_graph(sched, graph);
+    require(ggml_backend_sched_get_tensor_backend(sched, parameter) == &cpu_backend.backend,
+            "shared parameter assignment changed");
+    require(ggml_backend_sched_get_tensor_backend(sched, update) == &gpu_backend.backend,
+            "shared parameter update assignment changed");
+    require(update->view_src == parameter, "parameter update lost its in-place view");
+    require(update->src[0] == parameter, "parameter update would mutate a copy instead of the shared weight");
+
+    ggml_backend_sched_free(sched);
+    ggml_backend_buffer_free(buffer);
+}
+
 static void test_accel_offload_preference(
         enum ggml_backend_dev_type target_type,
         bool scheduler_allows_offload,
@@ -661,6 +703,7 @@ int main() {
     };
 
     for (enum ggml_backend_dev_type target_type : target_types) {
+        test_shared_parameter_update(target_type);
         for (enum ggml_backend_dev_type source_type : source_types) {
             test_shared_input(
                     target_type, source_type, memory_kind::host, memory_kind::device, tensor_kind::compute);
