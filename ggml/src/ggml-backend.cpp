@@ -852,6 +852,7 @@ struct ggml_backend_sched_split {
     struct ggml_tensor ** inputs;
     int n_inputs;
     int inputs_capacity;
+    bool shared_input_backends[GGML_SCHED_MAX_BACKENDS];
     // graph view of this split
     struct ggml_cgraph graph;
 };
@@ -1405,6 +1406,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         }
         split->i_start = 0;
         split->n_inputs = 0;
+        memset(split->shared_input_backends, 0, sizeof(split->shared_input_backends));
         int cur_backend_id = split->backend_id;
         for (; i < graph->n_nodes; i++) {
             struct ggml_tensor * node = graph->nodes[i];
@@ -1465,6 +1467,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split->backend_id = node_backend_id;
                 split->i_start = i;
                 split->n_inputs = 0;
+                memset(split->shared_input_backends, 0, sizeof(split->shared_input_backends));
                 cur_backend_id = node_backend_id;
             }
 
@@ -1548,6 +1551,16 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         split->inputs[n_inputs] = src;
                     }
                     node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
+                } else if (src_backend_id != cur_backend_id) {
+                    split->shared_input_backends[src_backend_id] = true;
+                }
+                // Metadata placement may identify storage, not the last writer.
+                for (ggml_tensor * dep = src; ggml_is_view_op(dep->op) && dep->src[0] != NULL;) {
+                    dep = dep->src[0];
+                    const int dep_backend_id = tensor_backend_id(dep);
+                    if (dep_backend_id >= 0 && dep_backend_id != cur_backend_id) {
+                        split->shared_input_backends[dep_backend_id] = true;
+                    }
                 }
             }
         }
@@ -1788,11 +1801,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
-        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id &&
+                !split->shared_input_backends[prev_backend_id]) {
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
                 ggml_backend_synchronize(sched->backends[prev_backend_id]);
+            }
+        }
+
+        // Shared inputs have no copy operation to wait for their producer.
+        // Copied inputs from other backends do not establish this dependency.
+        for (int b = 0; b < sched->n_backends; ++b) {
+            if (split->shared_input_backends[b]) {
+                ggml_backend_synchronize(sched->backends[b]);
             }
         }
 

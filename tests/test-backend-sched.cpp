@@ -516,6 +516,119 @@ static void test_shared_input(
     ggml_backend_buffer_free(source_buffer);
 }
 
+struct mock_pending_compute {
+    ggml_tensor * node = nullptr;
+    int completed = 0;
+};
+
+static enum ggml_status mock_enqueue_sqr(ggml_backend_t backend, ggml_cgraph * graph) {
+    auto * pending = static_cast<mock_pending_compute *>(backend->context);
+    require(pending->node == nullptr, "async mock command was overwritten before synchronization");
+    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+        ggml_tensor * node = ggml_graph_node(graph, i);
+        if (node->op == GGML_OP_VIEW) {
+            continue;
+        }
+        require(node->op == GGML_OP_SQR && pending->node == nullptr, "unexpected async mock graph");
+        pending->node = node;
+    }
+    require(pending->node != nullptr, "missing async mock computation");
+    return GGML_STATUS_SUCCESS;
+}
+
+static void mock_flush_sqr(ggml_backend_t backend) {
+    auto * pending = static_cast<mock_pending_compute *>(backend->context);
+    if (pending->node != nullptr) {
+        const float * input = static_cast<const float *>(pending->node->src[0]->data);
+        float * output = static_cast<float *>(pending->node->data);
+        for (int64_t i = 0; i < ggml_nelements(pending->node); ++i) {
+            output[i] = input[i] * input[i];
+        }
+        pending->node = nullptr;
+        ++pending->completed;
+    }
+}
+
+static enum ggml_status mock_compute_add(ggml_backend_t, ggml_cgraph * graph) {
+    require(ggml_graph_n_nodes(graph) == 1 && ggml_graph_node(graph, 0)->op == GGML_OP_ADD, "unexpected consumer mock graph");
+    ggml_tensor * node = ggml_graph_node(graph, 0);
+    const float * a = static_cast<const float *>(node->src[0]->data);
+    const float * b = static_cast<const float *>(node->src[1]->data);
+    float * output = static_cast<float *>(node->data);
+    for (int64_t i = 0; i < ggml_nelements(node); ++i) {
+        output[i] = a[i] + b[i];
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
+static void test_shared_input_async(bool copy_other_input, bool use_view) {
+    ggml_backend_buffer_type host_buft = make_mock_buffer_type(true);
+    ggml_backend_buffer_type producer_buft = make_mock_buffer_type(false);
+    ggml_backend_buffer_type other_buft = make_mock_buffer_type(false);
+    mock_backend_storage producer("MockAsyncGPU", GGML_BACKEND_DEVICE_TYPE_GPU, &producer_buft, &host_buft);
+    mock_backend_storage other("MockOther", GGML_BACKEND_DEVICE_TYPE_ACCEL, &other_buft, &host_buft);
+    mock_backend_storage consumer("MockCPU", GGML_BACKEND_DEVICE_TYPE_CPU, &host_buft, &host_buft);
+    producer_buft.device = &producer.device;
+    other_buft.device = &other.device;
+    host_buft.device = &consumer.device;
+    mock_pending_compute pending;
+    producer.backend.context = &pending;
+    producer.backend.iface.graph_compute = mock_enqueue_sqr;
+    producer.backend.iface.synchronize = mock_flush_sqr;
+    consumer.backend.iface.graph_compute = mock_compute_add;
+
+    ggml_backend_t backends[] = { &producer.backend, &other.backend, &consumer.backend };
+    ggml_backend_buffer_type_t bufts[] = { &producer_buft, &other_buft, &host_buft };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, bufts, 3, 16, false, false);
+    ggml_context_ptr ctx(ggml_init({ 8 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true }));
+    require(ctx != nullptr, "failed to create async shared-input context");
+    ggml_tensor * input = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 4);
+    ggml_tensor * shared = ggml_sqr(ctx.get(), input);
+    ggml_set_name(shared, "async_shared_output");
+    ggml_backend_buffer_ptr shared_buffer(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), &host_buft));
+    require(shared_buffer != nullptr, "failed to allocate async shared buffer");
+    ggml_tensor * extra = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 4);
+    ggml_set_name(extra, "other_backend_input");
+    ggml_backend_buffer_ptr extra_buffer(ggml_backend_alloc_ctx_tensors_from_buft(
+            ctx.get(), copy_other_input ? &other_buft : &host_buft));
+    require(extra_buffer != nullptr, "failed to allocate other-backend input");
+    ggml_tensor * visible = use_view ? ggml_view_1d(ctx.get(), shared, 4, 0) : shared;
+    ggml_tensor * output = ggml_add(ctx.get(), visible, extra);
+    ggml_cgraph * graph = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(graph, output);
+    ggml_backend_sched_set_tensor_backend(sched, input, &producer.backend);
+    ggml_backend_sched_set_tensor_backend(sched, shared, &producer.backend);
+    ggml_backend_sched_set_tensor_backend(sched, extra, &other.backend);
+    if (use_view) {
+        // A metadata node's placement need not identify its data producer.
+        ggml_backend_sched_set_tensor_backend(sched, visible, &other.backend);
+    }
+    ggml_backend_sched_set_tensor_backend(sched, output, &consumer.backend);
+
+    const float input_data[] = { 2, 3, 4, 5 };
+    const float old_data[] = { -100, -100, -100, -100 };
+    const float extra_data[] = { 1, 2, 3, 4 };
+    ggml_backend_tensor_set(input, input_data, 0, sizeof(input_data));
+    ggml_backend_tensor_set(shared, old_data, 0, sizeof(old_data));
+    ggml_backend_tensor_set(extra, extra_data, 0, sizeof(extra_data));
+    require(ggml_backend_sched_alloc_graph(sched, graph), "async shared graph allocation failed");
+    require(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS, "async shared graph failed");
+    require(output->src[0] == visible, "shared async output was unexpectedly copied");
+    require((output->src[1] != extra) == copy_other_input, "other-backend input copy does not match the test case");
+    require(pending.node == nullptr && pending.completed == 1, "async producer did not complete exactly once");
+    float result[4];
+    ggml_backend_tensor_get(output, result, 0, sizeof(result));
+    for (size_t i = 0; i < 4; ++i) {
+        const float expected = input_data[i] * input_data[i] + extra_data[i];
+        if (result[i] != expected) {
+            fprintf(stderr, "shared async input: copied_other=%d index=%zu actual=%g expected=%g\n",
+                    int(copy_other_input), i, double(result[i]), double(expected));
+        }
+        require(result[i] == expected, "shared-host input was consumed before its async producer completed");
+    }
+    ggml_backend_sched_free(sched);
+}
+
 static void test_shared_parameter_update(enum ggml_backend_dev_type target_type) {
     ggml_backend_buffer_type device_buft = make_mock_buffer_type(false);
     ggml_backend_buffer_type host_buft = make_mock_buffer_type(true);
@@ -692,6 +805,10 @@ int main() {
     test_buffer_free_observers_concurrent();
     test_buffer_free_observer_other_buffer();
     test_cpu_mapped_buffer_type_identity();
+    test_shared_input_async(false, false);
+    test_shared_input_async(true, false);
+    test_shared_input_async(false, true);
+    test_shared_input_async(true, true);
 
     const enum ggml_backend_dev_type target_types[] = {
         GGML_BACKEND_DEVICE_TYPE_GPU,
