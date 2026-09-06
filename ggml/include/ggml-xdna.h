@@ -33,11 +33,11 @@ struct ggml_backend_xdna_stats {
     uint64_t host_copy_bytes;
     uint64_t host_copy_time_ns;
     uint64_t weight_copy_bytes;
-    uint64_t kernel_submissions;
+    uint64_t kernel_submissions; // Successful start returns, including runs whose wait fails.
     uint64_t first_kernel_time_ns;
     uint64_t first_compute_time_ns;
-    uint64_t kernel_time_ns;
-    uint64_t total_compute_time_ns;
+    uint64_t kernel_time_ns; // All start/wait attempts; excludes abort.
+    uint64_t total_compute_time_ns; // Successful compute calls only.
 };
 
 struct ggml_backend_xdna_stats_v2 {
@@ -50,9 +50,9 @@ struct ggml_backend_xdna_stats_v2 {
     uint64_t activation_sync_calls;
     uint64_t activation_sync_bytes;
     uint64_t activation_sync_time_ns;
-    uint64_t run_start_calls;
+    uint64_t run_start_calls; // API attempts, including exceptions.
     uint64_t run_start_time_ns;
-    uint64_t run_wait_calls;
+    uint64_t run_wait_calls; // API attempts, including exceptions.
     uint64_t run_wait_time_ns;
     uint64_t first_run_start_time_ns;
     uint64_t first_run_wait_time_ns;

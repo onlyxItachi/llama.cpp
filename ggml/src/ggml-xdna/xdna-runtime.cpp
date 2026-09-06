@@ -604,6 +604,20 @@ struct runtime::impl {
             bound_weight_owner = nullptr;
         }
 
+        static void require_quiescent(ert_cmd_state state) noexcept {
+            // Blocking wait and abort have no host deadline; TIMEOUT means the scheduler reset the command.
+            switch (state) {
+                case ERT_CMD_STATE_COMPLETED:
+                case ERT_CMD_STATE_ERROR:
+                case ERT_CMD_STATE_ABORT:
+                case ERT_CMD_STATE_TIMEOUT:
+                    return;
+                default:
+                    GGML_LOG_ERROR("ggml_xdna: cannot establish XRT command quiescence from ERT state %d\n", int(state));
+                    std::abort();
+            }
+        }
+
         void abort_run_or_terminate() noexcept {
             if (run == nullptr) {
                 return;
@@ -612,7 +626,9 @@ struct runtime::impl {
             try {
                 // xrt::run::abort() is synchronous.  A userptr registration
                 // must never be released while a command can still access it.
-                run->abort();
+                const ert_cmd_state state = run->abort();
+                GGML_LOG_ERROR("ggml_xdna: XRT abort returned ERT state %d\n", int(state));
+                require_quiescent(state);
             } catch (const std::exception & e) {
                 GGML_LOG_ERROR("ggml_xdna: failed to quiesce an XRT command after an execution error: %s\n", e.what());
                 std::abort();
@@ -1004,6 +1020,7 @@ int runtime::compute(ggml_tensor * op) noexcept {
     }
 
     const auto total_start = std::chrono::steady_clock::now();
+    const char * phase = "state selection";
     try {
         // One persistent command BO/run is intentionally reused per backend.
         const std::lock_guard<std::mutex> lock(pimpl->compute_mutex);
@@ -1020,9 +1037,11 @@ int runtime::compute(ggml_tensor * op) noexcept {
                 variant.device_output_type != data_type::f32) {
             throw std::runtime_error("selected XDNA kernel variant has an unsupported host storage conversion");
         }
+        phase = "weight preparation";
         uint64_t weight_copy_bytes = 0;
         xrt::bo & weight_bo = pimpl->prepare_weight(*kernel, op->src[0], problem.weights_usage, &weight_copy_bytes);
 
+        phase = "activation packing";
         const auto activation_pack_start = std::chrono::steady_clock::now();
         ggml_fp32_to_bf16_row(
             static_cast<const float *>(op->src[1]->data),
@@ -1038,6 +1057,7 @@ int runtime::compute(ggml_tensor * op) noexcept {
         pimpl->host_copy_bytes.fetch_add(variant.device_activation_bytes);
         pimpl->host_copy_time_ns.fetch_add(activation_pack_ns);
 
+        phase = "activation synchronization";
         const auto activation_sync_start = std::chrono::steady_clock::now();
         kernel->activation_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE, variant.device_activation_bytes, 0);
         const uint64_t activation_sync_ns = elapsed_ns(
@@ -1050,6 +1070,7 @@ int runtime::compute(ggml_tensor * op) noexcept {
         pimpl->sync_to_device_time_ns.fetch_add(activation_sync_ns);
         host_memory_fence();
 
+        phase = "command binding";
         kernel->bound_weight_owner =
             problem.weights_usage == weight_usage::immutable ?
                 op->src[0]->buffer : nullptr;
@@ -1068,31 +1089,41 @@ int runtime::compute(ggml_tensor * op) noexcept {
         bool submitted = false;
         ert_cmd_state state;
         std::chrono::steady_clock::time_point run_start_end;
+        uint64_t run_start_ns = 0;
+        phase = "run start";
+        pimpl->run_start_calls.fetch_add(1);
         try {
             kernel->run->start();
             submitted = true;
             run_start_end = std::chrono::steady_clock::now();
+            run_start_ns = elapsed_ns(run_start_begin, run_start_end);
+            pimpl->run_start_time_ns.fetch_add(run_start_ns);
+            pimpl->kernel_submissions.fetch_add(1);
+            phase = "run wait";
+            pimpl->run_wait_calls.fetch_add(1);
             state = kernel->run->wait();
-            submitted = false;
         } catch (...) {
+            const auto failed_at = std::chrono::steady_clock::now();
             if (submitted) {
+                const uint64_t run_wait_ns = elapsed_ns(run_start_end, failed_at);
+                pimpl->run_wait_time_ns.fetch_add(run_wait_ns);
+                pimpl->kernel_time_ns.fetch_add(run_start_ns + run_wait_ns);
                 kernel->abort_run_or_terminate();
             } else {
+                run_start_ns = elapsed_ns(run_start_begin, failed_at);
+                pimpl->run_start_time_ns.fetch_add(run_start_ns);
+                pimpl->kernel_time_ns.fetch_add(run_start_ns);
                 kernel->reset_run();
             }
             throw;
         }
         const auto run_wait_end = std::chrono::steady_clock::now();
-        const uint64_t run_start_ns = elapsed_ns(run_start_begin, run_start_end);
         const uint64_t run_wait_ns = elapsed_ns(run_start_end, run_wait_end);
-        pimpl->run_start_calls.fetch_add(1);
-        pimpl->run_start_time_ns.fetch_add(run_start_ns);
-        pimpl->run_wait_calls.fetch_add(1);
         pimpl->run_wait_time_ns.fetch_add(run_wait_ns);
 
-        pimpl->kernel_submissions.fetch_add(1);
         const uint64_t kernel_ns = run_start_ns + run_wait_ns;
         pimpl->kernel_time_ns.fetch_add(kernel_ns);
+        impl::kernel_state::require_quiescent(state);
         if (state != ERT_CMD_STATE_COMPLETED) {
             GGML_LOG_ERROR("ggml_xdna: kernel returned ERT state %d\n", static_cast<int>(state));
             kernel->reset_run();
@@ -1100,6 +1131,7 @@ int runtime::compute(ggml_tensor * op) noexcept {
         }
         execution_guard.unlock();
 
+        phase = "output synchronization";
         const auto output_sync_start = std::chrono::steady_clock::now();
         kernel->output_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE, variant.device_output_bytes, 0);
         const uint64_t output_sync_ns = elapsed_ns(
@@ -1112,6 +1144,7 @@ int runtime::compute(ggml_tensor * op) noexcept {
         pimpl->sync_from_device_time_ns.fetch_add(output_sync_ns);
         host_memory_fence();
 
+        phase = "output copy";
         const auto output_copy_start = std::chrono::steady_clock::now();
         std::memcpy(op->data, kernel->output_data, variant.device_output_bytes);
         const uint64_t output_copy_ns = elapsed_ns(
@@ -1141,9 +1174,9 @@ int runtime::compute(ggml_tensor * op) noexcept {
         }
         return 0;
     } catch (const std::exception & e) {
-        GGML_LOG_ERROR("ggml_xdna: MUL_MAT execution failed: %s\n", e.what());
+        GGML_LOG_ERROR("ggml_xdna: MUL_MAT execution failed during %s: %s\n", phase, e.what());
     } catch (...) {
-        GGML_LOG_ERROR("ggml_xdna: MUL_MAT execution failed with an unknown XRT error\n");
+        GGML_LOG_ERROR("ggml_xdna: MUL_MAT execution failed during %s with an unknown error\n", phase);
     }
     return -1;
 }
