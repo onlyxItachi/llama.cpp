@@ -1250,6 +1250,8 @@ struct test_case {
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     virtual bool use_weight_context() { return false; }
+    // An independent fixture expectation, not a copy of backend eligibility rules.
+    virtual bool mutable_weight_fixture() { return false; }
     // Stateful cases can reuse the primary graph while the CPU comparison is rebuilt per invocation.
     virtual size_t test_invocation_count() { return 1; }
     virtual void prepare_test_invocation(ggml_context * ctx, size_t invocation) {
@@ -1638,7 +1640,7 @@ struct test_case {
             const ggml_tensor * weights = out->src[0];
             const bool immutable_weights =
                 ggml_backend_buffer_get_usage(weights->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
-                (weights->flags & GGML_TENSOR_FLAG_PARAM) == 0;
+                !mutable_weight_fixture();
             const auto expect_delta = [&](size_t invocation, const char * name,
                                           uint64_t before, uint64_t after, uint64_t expected) {
                 const bool matches = after >= before && after - before == expected;
@@ -5014,6 +5016,8 @@ struct test_mul_mat_weight_param : public test_mul_mat_weight {
     using test_mul_mat_weight::test_mul_mat_weight;
     using test_mul_mat_weight::build_graph;
 
+    bool mutable_weight_fixture() override { return true; }
+
     std::string vars() override {
         return test_mul_mat_weight::vars() + ",param=1";
     }
@@ -5029,6 +5033,9 @@ struct test_mul_mat_weight_param : public test_mul_mat_weight {
         ggml_tensor * out = ggml_get_tensor(ctx, "out");
         GGML_ASSERT(out != nullptr);
         ggml_tensor * weights = out->src[0];
+        if (weights->view_src != nullptr) {
+            weights = weights->view_src;
+        }
         GGML_ASSERT(weights != nullptr && weights->type == GGML_TYPE_BF16);
         GGML_ASSERT(ggml_is_contiguous(weights));
         GGML_ASSERT((weights->flags & GGML_TENSOR_FLAG_PARAM) != 0);
@@ -5043,6 +5050,24 @@ struct test_mul_mat_weight_param : public test_mul_mat_weight {
             value.bits ^= 0x8000u;
         }
         ggml_backend_tensor_set(weights, data.data(), 0, ggml_nbytes(weights));
+    }
+};
+
+struct test_mul_mat_weight_param_view : public test_mul_mat_weight_param {
+    using test_mul_mat_weight_param::test_mul_mat_weight_param;
+    using test_mul_mat_weight_param::build_graph;
+
+    std::string vars() override {
+        return test_mul_mat_weight_param::vars() + ",param_view=1";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * out = test_mul_mat_weight_param::build_graph(ctx, ctx_weights);
+        ggml_tensor * view = ggml_view_tensor(ctx_weights, out->src[0]);
+        GGML_ASSERT(view->flags == 0 && view->view_src == out->src[0]);
+        ggml_set_name(view, "a_view");
+        out->src[0] = view;
+        return out;
     }
 };
 
@@ -10102,6 +10127,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_weight_q4_0_deterministic(GGML_TYPE_Q4_0, GGML_TYPE_F32, 288, 1, 288, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_BF16, GGML_TYPE_F32, 288, 1, 288, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_weight_param(GGML_TYPE_BF16, GGML_TYPE_F32, 288, 1, 288, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_weight_param_view(GGML_TYPE_BF16, GGML_TYPE_F32, 288, 1, 288, {1, 1}, {1, 1}));
     // Llama 3.2 1B gate/up projection shape used by ggml-xdna.
     test_cases.emplace_back(new test_mul_mat_weight_bf16_deterministic(GGML_TYPE_BF16, GGML_TYPE_F32, 8192, 1, 2048, {1, 1}, {1, 1}));
     // Llama 3.2 3B gate/up projection shape used by ggml-xdna.

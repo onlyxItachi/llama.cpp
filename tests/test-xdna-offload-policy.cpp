@@ -202,6 +202,54 @@ static void test_variant(const ggml_xdna::xdna_kernel_variant & variant) {
     ggml_free(ctx);
 }
 
+static void test_weight_aliases(const ggml_xdna::xdna_kernel_variant & variant) {
+    using namespace ggml_xdna;
+    ggml_context * ctx = ggml_init({ 20 * ggml_tensor_overhead(), nullptr, true });
+    require(ctx != nullptr, "alias context allocation failed");
+    ggml_backend_buffer_t owner = ggml_backend_buffer_init(nullptr, {}, nullptr, 0);
+    ggml_backend_buffer_set_usage(owner, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_tensor * base = ggml_new_tensor_2d(ctx, weight_type(variant.weights_type), variant.k, 2 * variant.m);
+    ggml_tensor * activation = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, variant.k, variant.n);
+    base->buffer = owner;
+
+    const auto check = [&](ggml_tensor * weights, weight_usage expected, const char * message) {
+        weights->buffer = owner; // Model the buffer assigned when a GGML view is allocated.
+        ggml_tensor * output = ggml_mul_mat(ctx, weights, activation);
+        xdna_problem problem;
+        require(problem_from_ggml(output, variant.architecture, &problem) &&
+                problem.weights_usage == expected, message);
+        require(kernel_variant_supports(variant, problem), "alias lost its supported staging path");
+    };
+
+    ggml_set_param(base);
+    ggml_tensor * view = ggml_view_2d(ctx, base, variant.k, variant.m, base->nb[1], ggml_nbytes(base) / 2);
+    require(view->flags == 0 && view->view_src == base && view->view_offs > 0,
+            "offset view no longer has the expected GGML alias semantics");
+    check(view, weight_usage::mutable_buffer, "view of trainable weights was marked immutable");
+    ggml_tensor * nested = ggml_reshape_2d(ctx, view, variant.k, variant.m);
+    require(nested->view_src == base && nested->src[0] == view,
+            "nested metadata view did not retain its direct graph input");
+    check(nested, weight_usage::mutable_buffer, "nested view of trainable weights was marked immutable");
+
+    base->flags &= ~GGML_TENSOR_FLAG_PARAM;
+    ggml_tensor * middle_param = ggml_view_tensor(ctx, view);
+    ggml_set_param(middle_param);
+    ggml_tensor * hidden_param = ggml_view_tensor(ctx, middle_param);
+    require(hidden_param->flags == 0 && hidden_param->view_src == base && hidden_param->src[0] == nullptr &&
+            (base->flags & GGML_TENSOR_FLAG_PARAM) == 0,
+            "raw nested alias no longer erases the intermediate PARAM identity");
+    check(hidden_param, weight_usage::mutable_buffer, "flattened trainable alias was marked immutable");
+    check(middle_param, weight_usage::mutable_buffer, "trainable view itself was marked immutable");
+
+    ggml_tensor * immutable_view = ggml_view_2d(ctx, base, variant.k, variant.m, base->nb[1], 0);
+    check(immutable_view, weight_usage::mutable_buffer, "unproven alias immutability was assumed");
+    ggml_tensor * leaf = ggml_new_tensor_2d(ctx, weight_type(variant.weights_type), variant.k, variant.m);
+    check(leaf, weight_usage::immutable, "ordinary immutable weights lost persistent registration eligibility");
+
+    ggml_backend_buffer_free(owner);
+    ggml_free(ctx);
+}
+
 int main() {
     size_t variant_count = 0;
     const ggml_xdna::xdna_kernel_variant * variants = ggml_xdna::kernel_variants(&variant_count);
@@ -210,6 +258,7 @@ int main() {
 
     for (size_t i = 0; i < variant_count; ++i) {
         test_variant(variants[i]);
+        test_weight_aliases(variants[i]);
         for (size_t j = 0; j < i; ++j) {
             require(strcmp(variants[i].id, variants[j].id) != 0, "duplicate variant identity");
             require(strcmp(variants[i].environment_variable, variants[j].environment_variable) != 0,
