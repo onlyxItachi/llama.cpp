@@ -1598,7 +1598,7 @@ struct test_case {
                 }
                 if (invocation != 0 && is_xdna_backend) {
                     // XDNA GEMV is a deterministic linear map with sign-symmetric finite F32-to-BF16 conversion.
-                    // Negating the full activation must negate every output; float equality equates +0 and -0.
+                    // Negating one full operand must negate every output; float equality equates +0 and -0.
                     const bool sign_symmetric = current_output.size() == first_output.size() &&
                         std::equal(
                             current_output.begin(), current_output.end(), first_output.begin(),
@@ -1620,6 +1620,10 @@ struct test_case {
         }
 
         if (get_xdna_stats != nullptr && stats_complete) {
+            const ggml_tensor * weights = out->src[0];
+            const bool immutable_weights =
+                ggml_backend_buffer_get_usage(weights->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                (weights->flags & GGML_TENSOR_FLAG_PARAM) == 0;
             const auto expect_delta = [&](size_t invocation, const char * name,
                                           uint64_t before, uint64_t after, uint64_t expected) {
                 const bool matches = after >= before && after - before == expected;
@@ -1651,17 +1655,20 @@ struct test_case {
                 expect_delta(invocation, "output copy bytes", before.output_copy_bytes,
                              after.output_copy_bytes, ggml_nbytes(out));
                 expect_delta(invocation, "root buffer registration", before.base.buffer_registrations,
-                             after.base.buffer_registrations, invocation == 0 ? 1 : 0);
+                             after.base.buffer_registrations, immutable_weights && invocation == 0 ? 1 : 0);
                 expect_delta(invocation, "root buffer registration hit", before.base.buffer_registration_hits,
                              after.base.buffer_registration_hits, 0);
                 expect_delta(invocation, "weight registration", before.base.weight_registrations,
-                             after.base.weight_registrations, invocation == 0 ? 1 : 0);
+                             after.base.weight_registrations, immutable_weights && invocation == 0 ? 1 : 0);
                 expect_delta(invocation, "weight registration hit", before.base.weight_registration_hits,
-                             after.base.weight_registration_hits, invocation == 0 ? 0 : 1);
+                             after.base.weight_registration_hits, immutable_weights && invocation != 0 ? 1 : 0);
                 expect_delta(invocation, "weight sync", before.base.weight_sync_to_device_calls,
-                             after.base.weight_sync_to_device_calls, invocation == 0 ? 1 : 0);
+                             after.base.weight_sync_to_device_calls, !immutable_weights || invocation == 0 ? 1 : 0);
+                expect_delta(invocation, "weight sync bytes", before.base.weight_sync_to_device_bytes,
+                             after.base.weight_sync_to_device_bytes,
+                             !immutable_weights || invocation == 0 ? ggml_nbytes(weights) : 0);
                 expect_delta(invocation, "weight copy bytes", before.base.weight_copy_bytes,
-                             after.base.weight_copy_bytes, 0);
+                             after.base.weight_copy_bytes, immutable_weights ? 0 : ggml_nbytes(weights));
             }
         }
 
@@ -4984,6 +4991,42 @@ struct test_mul_mat_weight : public test_mul_mat {
         ggml_tensor * out = ggml_mul_mat(ctx, a, b);
         ggml_set_name(out, "out");
         return out;
+    }
+};
+
+struct test_mul_mat_weight_param : public test_mul_mat_weight {
+    using test_mul_mat_weight::test_mul_mat_weight;
+    using test_mul_mat_weight::build_graph;
+
+    std::string vars() override {
+        return test_mul_mat_weight::vars() + ",param=1";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * out = test_mul_mat_weight::build_graph(ctx, ctx_weights);
+        ggml_set_param(out->src[0]);
+        return out;
+    }
+
+    void prepare_test_invocation(ggml_context * ctx, size_t invocation) override {
+        GGML_ASSERT(invocation < test_invocation_count());
+        ggml_tensor * out = ggml_get_tensor(ctx, "out");
+        GGML_ASSERT(out != nullptr);
+        ggml_tensor * weights = out->src[0];
+        GGML_ASSERT(weights != nullptr && weights->type == GGML_TYPE_BF16);
+        GGML_ASSERT(ggml_is_contiguous(weights));
+        GGML_ASSERT((weights->flags & GGML_TENSOR_FLAG_PARAM) != 0);
+        GGML_ASSERT(ggml_backend_buffer_get_usage(weights->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        if (invocation == 0) {
+            return;
+        }
+
+        std::vector<ggml_bf16_t> data(ggml_nelements(weights));
+        ggml_backend_tensor_get(weights, data.data(), 0, ggml_nbytes(weights));
+        for (ggml_bf16_t & value : data) {
+            value.bits ^= 0x8000u;
+        }
+        ggml_backend_tensor_set(weights, data.data(), 0, ggml_nbytes(weights));
     }
 };
 
@@ -10039,6 +10082,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Fixed batch-1 shapes used by the initial ggml-xdna hardware kernels.
     test_cases.emplace_back(new test_mul_mat_weight_q4_0_deterministic(GGML_TYPE_Q4_0, GGML_TYPE_F32, 288, 1, 288, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_weight(GGML_TYPE_BF16, GGML_TYPE_F32, 288, 1, 288, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_weight_param(GGML_TYPE_BF16, GGML_TYPE_F32, 288, 1, 288, {1, 1}, {1, 1}));
     // Llama 3.2 1B gate/up projection shape used by ggml-xdna.
     test_cases.emplace_back(new test_mul_mat_weight_bf16_deterministic(GGML_TYPE_BF16, GGML_TYPE_F32, 8192, 1, 2048, {1, 1}, {1, 1}));
     // Llama 3.2 3B gate/up projection shape used by ggml-xdna.
