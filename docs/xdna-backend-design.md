@@ -337,6 +337,23 @@ An `xrt::run` retains its bound weight BO, so owner eviction also clears that bi
 The next call recreates the run lazily and binds the current weight.
 A binding exception likewise discards a partially bound run.
 If `wait()` throws after submission, the runtime synchronously calls `xrt::run::abort()` before releasing borrowed storage, then resets the run; failure to abort terminates the process rather than risk an active userptr.
+
+An exception from `start()` is not proof that submission never occurred: the
+shim can perform fallible bookkeeping after the submit ioctl. The runtime
+queries the actual command state and resets only after an explicitly accepted
+terminal state (COMPLETED, ERROR, ABORT or scheduler TIMEOUT). NEW, other
+nonterminal/unknown states, or failure to query the state fail-stop before BOs
+or borrowed pages can be released. An API timed-wait deadline is not a terminal
+command state. This deliberately favors safety over availability.
+
+Disabling or leaking only the backend cannot protect borrowed model pages:
+the caller can still free the GGML buffer or unmap an external allocation.
+Observers notify but do not retain/veto owner destruction. Consequently unknown
+quiescence remains process-fatal under this memory contract. Applications that
+need containment should isolate inference and its memory in a worker process;
+safe process cleanup still depends on the OS/driver teardown contract. An
+interposed exception after real completion or a synthetic ERT state validates
+the guard, not recovery from an actual device failure in flight.
 Distinct observer handles may be added and removed concurrently while the owner buffer is live.
 The caller must serialize owner destruction against buffer use, observer mutation, and backend teardown; observers do not extend allocation lifetime.
 

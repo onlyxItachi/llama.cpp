@@ -605,7 +605,8 @@ struct runtime::impl {
         }
 
         static void require_quiescent(ert_cmd_state state) noexcept {
-            // Blocking wait and abort have no host deadline; TIMEOUT means the scheduler reset the command.
+            // Only actual command states are accepted here. Blocking wait and
+            // abort have no host deadline; a timed-wait API timeout is not proof.
             switch (state) {
                 case ERT_CMD_STATE_COMPLETED:
                 case ERT_CMD_STATE_ERROR:
@@ -616,6 +617,22 @@ struct runtime::impl {
                     GGML_LOG_ERROR("ggml_xdna: cannot establish XRT command quiescence from ERT state %d\n", int(state));
                     std::abort();
             }
+        }
+
+        void retire_failed_start_or_terminate() noexcept {
+            try {
+                // start() has no strong exception guarantee across XRT/shim
+                // submission. NEW is ambiguous: the driver may already own the
+                // command. Do not release borrowed pages merely because start
+                // threw, or rely on abort accepting a partly submitted run.
+                const ert_cmd_state state = run->state();
+                GGML_LOG_ERROR("ggml_xdna: XRT start failed; actual ERT state %d\n", int(state));
+                require_quiescent(state);
+            } catch (...) {
+                GGML_LOG_ERROR("ggml_xdna: cannot query command quiescence after XRT start failure\n");
+                std::abort();
+            }
+            reset_run();
         }
 
         void abort_run_or_terminate() noexcept {
@@ -630,6 +647,9 @@ struct runtime::impl {
                 GGML_LOG_ERROR("ggml_xdna: XRT abort returned ERT state %d\n", int(state));
                 require_quiescent(state);
             } catch (const std::exception & e) {
+                // abort() can submit a second command targeting this run's BO.
+                // Even a completed original does not prove that cancellation
+                // command quiescent after an exception; it is not public state.
                 GGML_LOG_ERROR("ggml_xdna: failed to quiesce an XRT command after an execution error: %s\n", e.what());
                 std::abort();
             } catch (...) {
@@ -1113,7 +1133,7 @@ int runtime::compute(ggml_tensor * op) noexcept {
                 run_start_ns = elapsed_ns(run_start_begin, failed_at);
                 pimpl->run_start_time_ns.fetch_add(run_start_ns);
                 pimpl->kernel_time_ns.fetch_add(run_start_ns);
-                kernel->reset_run();
+                kernel->retire_failed_start_or_terminate();
             }
             throw;
         }

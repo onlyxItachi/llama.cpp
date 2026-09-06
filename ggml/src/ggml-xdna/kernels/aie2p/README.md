@@ -26,28 +26,40 @@ control, or 5.229x slower. The retained research report and the four-model
 ROCm/KV baseline are summarized in `docs/xdna-backend-design.md`; they are
 evidence for the next kernel decision, not additional advertised capability.
 
-Kernel artifacts are generated, not committed. With an MLIR-AIE IRON
-environment containing Peano:
+Kernel artifacts are generated, not committed. The validated portable build
+environment is Linux x86_64 with glibc >= 2.35 and CPython 3.12. From this
+directory, create a clean build-only environment (no Torch dependencies):
 
 ```sh
 python3.12 -m venv /path/to/ironenv
-/path/to/ironenv/bin/python -m pip install \
-    "mlir_aie==1.3.4" \
-    -f https://github.com/Xilinx/mlir-aie/releases/expanded_assets/v1.3.4
-/path/to/ironenv/bin/python -m pip install \
-    "llvm-aie==21.0.0.2026062301+cb664e8c" \
-    -f https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly
+/path/to/ironenv/bin/python -m pip install --no-cache-dir -r requirements-build.txt
+/path/to/ironenv/bin/python -m pip check
 ```
 
-Those are the independently reproduced versions used for the physical results
-below; Torch or Torch-XDNA is not a build dependency. Then generate the local
-artifacts:
+The requirements pin MLIR-AIE 1.3.4, Peano 21.0.0.2026062301+cb664e8c,
+their release-wheel SHA256 digests, and Python dependencies. `aiecc` comes from
+the MLIR-AIE wheel. The Peano asset lives under a moving nightly release:
+if it disappears, obtain the same hash-verified wheel from a retained mirror;
+do not silently substitute a different compiler. Retain the wheels and
+requirements with release build evidence. Install the XRT SDK separately
+(the original validated SDK is 2.20.0); its headers/runtime are also needed to
+build/use the backend. Then generate all seven artifacts:
 
 ```sh
 source /opt/xilinx/xrt/setup.sh
-make IRON_ENV=/path/to/ironenv
+env -u PYTHONPATH -u PYTHONHOME make IRON_ENV=/path/to/ironenv AIECC_JOBS=1 -j1 all
 export GGML_XDNA_AIE2P_Q4_0_GEMV_BUNDLE="$PWD/gemv-q4_0-288.ggmlxdna"
 ```
+
+Reproduction means the same declared architecture/ABI, kernel metadata and
+seven-specialization inventory, followed by the same controller checks and
+physical CPU-reference correctness. It does not require identical xclbin
+bytes: tool-generated metadata can vary. A successful build or artifact-header
+check alone is not physical validation. Record source SHA, dependency versions,
+bundle hashes and runtime/driver versions with each acceptance run. These
+Python/compiler dependencies are never required at inference runtime. For
+relocatable static, dynamic and disabled-backend SDK consumption checks see
+[`../../ci/README.md`](../../ci/README.md).
 
 For the E4B K/V and gate/up projection artifacts, configure their registered
 bundles:
