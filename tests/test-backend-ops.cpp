@@ -429,7 +429,7 @@ static std::string var_to_str(ggml_op_pool pool) {
     }
 }
 
-static std::string var_to_str(ggml_scale_mode mode) {
+static std::string scale_mode_to_str(uint32_t mode) {
     std::string str;
     switch (mode & 0xFF) {
         case GGML_SCALE_MODE_NEAREST:  str = "nearest"; break;
@@ -7510,15 +7510,15 @@ struct test_upscale : public test_case {
     const std::array<int64_t, 4> ne;
     const int32_t scale_factor;
     const bool transpose;
-    const ggml_scale_mode mode;
+    const uint32_t mode;
 
     std::string vars() override {
-        return VARS_TO_STR5(type, ne, scale_factor, mode, transpose);
+        return VARS_TO_STR3(type, ne, scale_factor) + ",mode=" + scale_mode_to_str(mode) + "," + VAR_TO_STR(transpose);
     }
 
     test_upscale(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne = {512, 512, 3, 1},
-            int32_t scale_factor = 2, ggml_scale_mode mode = GGML_SCALE_MODE_NEAREST, bool transpose = false)
+            int32_t scale_factor = 2, uint32_t mode = GGML_SCALE_MODE_NEAREST, bool transpose = false)
         : type(type), ne(ne), scale_factor(scale_factor), transpose(transpose), mode(mode) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -7530,7 +7530,10 @@ struct test_upscale : public test_case {
             ggml_set_name(a, "a_transposed");
         }
 
-        ggml_tensor * out = ggml_upscale(ctx, a, scale_factor, mode);
+        // Flags belong to the uint32_t interpolate API, not ggml_scale_mode.
+        ggml_tensor * out = (mode & ~UINT32_C(0xff)) ?
+            ggml_interpolate(ctx, a, a->ne[0] * scale_factor, a->ne[1] * scale_factor, a->ne[2], a->ne[3], mode) :
+            ggml_upscale(ctx, a, scale_factor, static_cast<ggml_scale_mode>(mode));
         ggml_set_name(out, "out");
 
         return out;
@@ -7542,16 +7545,16 @@ struct test_interpolate : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
     const std::array<int64_t, 4> ne_tgt;
-    const ggml_scale_mode mode = GGML_SCALE_MODE_NEAREST;
+    const uint32_t mode = GGML_SCALE_MODE_NEAREST;
 
     std::string vars() override {
-        return VARS_TO_STR4(type, ne, ne_tgt, mode);
+        return VARS_TO_STR3(type, ne, ne_tgt) + ",mode=" + scale_mode_to_str(mode);
     }
 
     test_interpolate(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne     = {2, 5,  7, 11},
             std::array<int64_t, 4> ne_tgt = {5, 7, 11, 13},
-            ggml_scale_mode mode = GGML_SCALE_MODE_NEAREST)
+            uint32_t mode = GGML_SCALE_MODE_NEAREST)
         : type(type), ne(ne), ne_tgt(ne_tgt), mode(mode) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -10709,16 +10712,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     //    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {i, 2, 1, 3}, rand() % i + 1));
     //}
 
-    for (ggml_scale_mode mode : {GGML_SCALE_MODE_NEAREST, GGML_SCALE_MODE_BILINEAR, GGML_SCALE_MODE_BICUBIC, ggml_scale_mode(GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ANTIALIAS)}) {
+    for (uint32_t mode : std::array<uint32_t, 4>{GGML_SCALE_MODE_NEAREST, GGML_SCALE_MODE_BILINEAR, GGML_SCALE_MODE_BICUBIC, GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ANTIALIAS}) {
         test_cases.emplace_back(new test_upscale(GGML_TYPE_F32, {512, 512, 3, 2}, 2, mode));
         test_cases.emplace_back(new test_upscale(GGML_TYPE_F32, {512, 512, 3, 2}, 2, mode, true));
         test_cases.emplace_back(new test_interpolate(GGML_TYPE_F32, {2, 5,  7, 11}, {5, 7, 11, 13}, mode));
         test_cases.emplace_back(new test_interpolate(GGML_TYPE_F32, {5, 7, 11, 13}, {2, 5,  7, 11}, mode));
     }
     for (ggml_scale_mode mode : {GGML_SCALE_MODE_BILINEAR, GGML_SCALE_MODE_BICUBIC}) {
-        test_cases.emplace_back(new test_interpolate(GGML_TYPE_F32, {2, 5, 7, 11}, {5, 7, 11, 13}, (ggml_scale_mode)(mode | GGML_SCALE_FLAG_ALIGN_CORNERS)));
-        test_cases.emplace_back(new test_interpolate(GGML_TYPE_F32, {1, 4, 3, 2}, {2, 8, 3, 2}, (ggml_scale_mode)(mode | GGML_SCALE_FLAG_ALIGN_CORNERS)));
-        test_cases.emplace_back(new test_interpolate(GGML_TYPE_F32, {4, 1, 3, 2}, {1, 1, 3, 2}, (ggml_scale_mode)(mode | GGML_SCALE_FLAG_ALIGN_CORNERS)));
+        test_cases.emplace_back(new test_interpolate(GGML_TYPE_F32, {2, 5, 7, 11}, {5, 7, 11, 13}, mode | GGML_SCALE_FLAG_ALIGN_CORNERS));
+        test_cases.emplace_back(new test_interpolate(GGML_TYPE_F32, {1, 4, 3, 2}, {2, 8, 3, 2}, mode | GGML_SCALE_FLAG_ALIGN_CORNERS));
+        test_cases.emplace_back(new test_interpolate(GGML_TYPE_F32, {4, 1, 3, 2}, {1, 1, 3, 2}, mode | GGML_SCALE_FLAG_ALIGN_CORNERS));
     }
 
     test_cases.emplace_back(new test_sum());
