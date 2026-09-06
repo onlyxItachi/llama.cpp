@@ -1,7 +1,27 @@
 # Native AMD XDNA backend: bring-up design and evidence
 
-Status: pre-upstream candidate (3) for the documented Linux/AIE2P scope; not an upstream-quality candidate (4), updated 2026-09-05.
+Status: pre-upstream candidate (3) for the documented Linux/AIE2P scope; not an upstream-quality candidate (4), updated 2026-09-06.
 This document records what was inspected and physically exercised; it is not a claim of production-ready XDNA decode.
+
+## Upstream synchronization and failure-path validation (2026-09-06)
+
+The previous pass had already closed the large upstream gap. This continuation starts at published `44e26d284c3c818c9de8fa518dfddf68624d1b23` and rebases onto `9e0e220594af405a62835dc3a27495729fd8506b`, six newer upstream commits. All 50 development changes remain patch-equivalent; `backup/xdna-before-upstream-20260906-44e26d2` preserves the prior branch. A second fetch before final validation found the same upstream head. Scheduler/buffer interfaces and XDNA/AOT sources did not change in this upstream delta. The host backend was rebuilt; the unchanged seven fresh AOT bundles were physically revalidated.
+
+Upstream now supports JSONL logging through both a CLI switch and environment variables. The new real-GGUF runner explicitly selects `--no-log-jsonl` and clears inherited logging variables, keeping generated-text comparisons separate from logs. Final smoke runs deliberately inherit `LLAMA_ARG_LOG_JSONL=1` to exercise this guard.
+
+The existing backend operation test now includes a persistent BF16 288x288 trainable-weight case. It marks the tensor as `PARAM` before use, negates all weights for its second invocation, and checks CPU agreement, exact XDNA sign reversal, per-call staging/synchronization, and absence of immutable registrations. The retained old backend fails this in-tree case; current XDNA and HIP pass it. This extends coverage without adding a kernel or changing scheduling capability.
+
+Failure accounting now counts start/wait attempts at their call boundaries and records a known submission immediately after `start()` returns. A throwing wait no longer erases evidence of device work. Attempt timings exclude subsequent abort work; successful-compute and first-success timings retain their existing meaning. Diagnostics identify the failing execution phase, and the statistics ABI is unchanged.
+
+The installed XRT 2.20 headers and matching source `021204355eeaa034ff69aae407ace2265adf047a` distinguish a reset timeout from `NORESPONSE`, which means reset failed. Synchronous abort can return an already-completed command's existing state without another reset. The runtime therefore requires an explicit supported terminal state before resetting bindings or releasing execution ownership. Blocking wait and abort accept `COMPLETED`, `ERROR`, `ABORT`, and scheduler `TIMEOUT`; live, unknown, and failed-reset states terminate rather than release potentially active borrowed storage. This is contract hardening, not a reproduced hardware reset defect.
+
+A cache-local interposer waits for actual device completion before injecting one exception. Before the accounting fix, both real launches occur but the backend reports only one submission/start/wait. After the fix, it reports both, leaves the first failed destination poisoned, and successfully retries the same graph with a changed activation, exact CPU output, one registration/synchronization, and zero immutable-weight copies. Separate synthetic `NORESPONSE` wait/abort returns and a `SUBMITTED` wait return exercise the fail-stop guard after the real command is already complete. These tests do not establish in-flight abort or failed-reset recovery.
+
+All four focused host tests pass with XRT disabled, with runtime enabled, under ThreadSanitizer, and under AddressSanitizer/UndefinedBehaviorSanitizer. Final physical tests pass all seven immutable specializations with fourteen changing-input launches, plus the trainable-weight case. The HIP operation control also passes all seven cases and the trainable case.
+
+Final real-GGUF tests cover `stories15M-q4_0.gguf` and a native BF16 1B model, each with CPU, XDNA, HIP, forced HIP+XDNA, and ordinary HIP-first+XDNA placement. All five configurations agree on generated text for each model: SHA-256 `afbaea16edb09763443b80c13cd58d7c61a40b9d0eb3a4c7807fde9ccfb19c3f` and `5d78704928839cc3450ec9f4bc7f6aa8cc65924afb93dd027201965be5c1d891`, respectively. The 1B forced-hybrid run completes 994 NPU calls from shared host-backed model storage, with 32 weight views, 962 reuse hits, one-time synchronization of 1 GiB, and zero immutable-weight copies. Ordinary HIP-first placement records zero NPU calls. These remain 32-token functional smoke tests, not every-logit validation or a performance comparison.
+
+Evidence, sealed input identities, failure-test sources, and terminal results are retained in `/home/hamza-usta/.cache/llama-xdna-upstream-20260906-vmwizI`. Earlier evidence remains intact. No performance preference changed, no unused fusion matcher was added, and inference still has no compiler/Python dependency. Readiness remains level 3: independent human review of generic core changes, broader driver/failure coverage, portable artifact/package CI, and matched end-to-end performance remain open.
 
 ## Current-upstream completion pass (2026-09-05)
 
