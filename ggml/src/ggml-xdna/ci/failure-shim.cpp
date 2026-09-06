@@ -13,6 +13,7 @@ namespace {
 enum class failure_mode {
     wait_throw, start_throw, wait_noresponse, wait_submitted, abort_noresponse,
     start_state_new, start_state_submitted, start_state_throw, prestart_throw, abort_throw,
+    wait_error, wait_abort, wait_timeout,
 };
 
 failure_mode mode = failure_mode::wait_throw;
@@ -57,7 +58,8 @@ extern "C" bool xdna_failure_test_reset(const char * name) {
         return false;
     }
     const char * names[] = { "wait-throw", "start-throw", "wait-noresponse", "wait-submitted", "abort-noresponse",
-        "start-state-new", "start-state-submitted", "start-state-throw", "prestart-throw", "abort-throw" };
+        "start-state-new", "start-state-submitted", "start-state-throw", "prestart-throw", "abort-throw",
+        "wait-error", "wait-abort", "wait-timeout" };
     size_t selected = 0;
     for (; selected < sizeof(names) / sizeof(names[0]); ++selected) {
         if (std::strcmp(name, names[selected]) == 0) {
@@ -129,8 +131,12 @@ ert_cmd_state xrt::run::wait(const std::chrono::milliseconds & timeout) const {
         completions.fetch_add(1);
         if (armed.exchange(false)) {
             injections.fetch_add(1);
-            if (mode == failure_mode::wait_noresponse || mode == failure_mode::wait_submitted) {
-                const auto reported = mode == failure_mode::wait_submitted ? ERT_CMD_STATE_SUBMITTED : ERT_CMD_STATE_NORESPONSE;
+            if (mode == failure_mode::wait_noresponse || mode == failure_mode::wait_submitted ||
+                mode == failure_mode::wait_error || mode == failure_mode::wait_abort || mode == failure_mode::wait_timeout) {
+                const auto reported = mode == failure_mode::wait_error ? ERT_CMD_STATE_ERROR :
+                    mode == failure_mode::wait_abort ? ERT_CMD_STATE_ABORT :
+                    mode == failure_mode::wait_timeout ? ERT_CMD_STATE_TIMEOUT :
+                    mode == failure_mode::wait_submitted ? ERT_CMD_STATE_SUBMITTED : ERT_CMD_STATE_NORESPONSE;
                 std::fprintf(stderr, "failure-shim: category=C phase=wait real_state=4 synthetic_state=%d\n", int(reported));
                 return reported;
             }

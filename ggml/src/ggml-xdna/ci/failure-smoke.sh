@@ -74,7 +74,8 @@ else
 fi
 ulimit -c 0
 for mode in wait-throw start-throw wait-noresponse wait-submitted abort-noresponse \
-            start-state-new start-state-submitted start-state-throw prestart-throw abort-throw; do
+            start-state-new start-state-submitted start-state-throw prestart-throw abort-throw \
+            wait-error wait-abort wait-timeout; do
     expected=134
     marker=
     diagnostic='ggml_xdna: cannot establish XRT command quiescence'
@@ -86,6 +87,9 @@ for mode in wait-throw start-throw wait-noresponse wait-submitted abort-norespon
         start-throw)
             expected=0; category=B
             marker='failure-shim: category=B phase=start real_state=4 injected_exception=1' ;;
+        wait-error) expected=0; marker='failure-shim: category=C phase=wait real_state=4 synthetic_state=5' ;;
+        wait-abort) expected=0; marker='failure-shim: category=C phase=wait real_state=4 synthetic_state=6' ;;
+        wait-timeout) expected=0; marker='failure-shim: category=C phase=wait real_state=4 synthetic_state=8' ;;
         wait-noresponse) marker='failure-shim: category=C phase=wait real_state=4 synthetic_state=9' ;;
         wait-submitted) marker='failure-shim: category=C phase=wait real_state=4 synthetic_state=7' ;;
         abort-noresponse) marker='failure-shim: category=C phase=abort real_state=4 synthetic_state=9' ;;
@@ -106,6 +110,7 @@ for mode in wait-throw start-throw wait-noresponse wait-submitted abort-norespon
     mkdir -- "$trial"
     # Return the child's numeric status so timeout does not re-raise SIGABRT
     # in its own process, where the runner's no-core setting does not apply.
+    # shellcheck disable=SC2016
     command=(timeout --signal=TERM --kill-after=15s 180s bash -c '"$@"; status=$?; exit "$status"' _
              env "LD_PRELOAD=$output/failure-shim.so"
              "$output/failure-test" "$bin/libggml-xdna.so" "$bin/libggml-cpu.so" "$mode")
@@ -131,4 +136,4 @@ done
 stage=verify-input-identity
 sha256sum -c "$output/inputs.sha256" > "$output/inputs-after.log"
 stage=complete
-echo 'PASS: ten attributed failure-policy cases; no real in-flight failure claim'
+echo 'PASS: thirteen attributed failure-policy cases; no real in-flight failure claim'

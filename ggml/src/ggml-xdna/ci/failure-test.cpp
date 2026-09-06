@@ -24,7 +24,9 @@ int main(int argc, char ** argv) {
     }
     const bool start_failure = std::strcmp(argv[3], "start-throw") == 0;
     const bool wait_failure = std::strcmp(argv[3], "wait-throw") == 0;
-    const bool expect_failstop = !start_failure && !wait_failure;
+    const bool terminal_failure = std::strcmp(argv[3], "wait-error") == 0 ||
+        std::strcmp(argv[3], "wait-abort") == 0 || std::strcmp(argv[3], "wait-timeout") == 0;
+    const bool expect_failstop = !start_failure && !wait_failure && !terminal_failure;
     auto reset = reinterpret_cast<bool (*)(const char *)>(dlsym(RTLD_DEFAULT, "xdna_failure_test_reset"));
     auto snapshot = reinterpret_cast<bool (*)(uint64_t *, size_t, int *)>(
         dlsym(RTLD_DEFAULT, "xdna_failure_test_snapshot"));
@@ -148,7 +150,7 @@ int main(int argc, char ** argv) {
             for (int64_t row = 0; row < m; ++row) {
                 const float error = std::fabs(output[row] - reference[row]);
                 matched = matched && std::isfinite(output[row]) && std::isfinite(reference[row]) &&
-                    error <= 5e-4f + 5e-4f * std::fabs(reference[row]) && reference[row] == -first_reference[row];
+                    output[row] == reference[row] && reference[row] == -first_reference[row];
                 changed = changed || reference[row] != first_reference[row];
                 max_error = std::max(max_error, error);
             }
@@ -186,9 +188,9 @@ int main(int argc, char ** argv) {
         const uint64_t starts = uint64_t(call + 1);
         const std::array<uint64_t, 7> wanted = start_failure ?
             std::array<uint64_t, 7>{starts, uint64_t(call), 0, 1, starts, 1, 1} :
-            std::array<uint64_t, 7>{starts, starts, 1, 1, starts, 0, 0};
+            std::array<uint64_t, 7>{starts, starts, uint64_t(wait_failure), 1, starts, 0, 0};
         require(counts == wanted, "exact real starts/waits, quiescence check, completion and injection counts");
-        require(abort_result == (start_failure ? -1 : 4), "abort absent or real already-completed abort result");
+        require(abort_result == (wait_failure ? 4 : -1), "abort absent or real already-completed abort result");
         std::printf("shim_call=%d starts=%" PRIu64 " waits=%" PRIu64 " aborts=%" PRIu64
             " injections=%" PRIu64 " completed_waits=%" PRIu64 " state_queries=%" PRIu64
             " direct_waits=%" PRIu64 " abort_state=%d\n",

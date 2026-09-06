@@ -34,9 +34,12 @@ loader path; the test rejects a backend resolving XRT coreutil outside that SDK.
 The caller must also serialize against compilers and other accelerator workloads;
 `XDNA_CI_PHYSICAL_LOCK` selects the test's cooperative device lock.
 
-Ten cases check post-completion start/wait exceptions with poisoned output and
+Thirteen cases check post-completion start/wait exceptions with poisoned output and
 same-backend changing-input CPU-reference retry; synthetic nonterminal/error-query
-states; an abort exception after completion; and a pre-submission host exception.
+states; synthetic terminal ERROR/ABORT/TIMEOUT returns with CPU-exact retry; an
+abort exception after completion; and a pre-submission host exception. The three
+terminal-state cases substitute results only after a real COMPLETED wait. They
+are category C, not actual hardware errors or timed-wait API timeout evidence.
 Each case requires both the exact injection marker and expected runtime diagnostic
 or success receipt, not merely a signal or exit code. Source/library/artifact hashes
 are checked before and after. `kernel_submissions` counts successful `start()`
